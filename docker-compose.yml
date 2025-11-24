@@ -1,0 +1,76 @@
+version: "3.8"
+
+services:
+  recovery-manager:
+    image: ${RECOVERY_MANAGER_IMAGE:-docker-registry.amirmuz.com/recovery-manager:latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: recovery-manager
+    hostname: recovery-manager
+
+    # Environment variables (can also use .env file)
+    environment:
+      - PYMONNET_URL=http://192.168.2.50:6969
+      - POLL_INTERVAL=5
+      - NODE_CPU_THRESHOLD=85
+      - NODE_MEM_THRESHOLD=90
+      - CONTAINER_CPU_THRESHOLD=95
+      - COOLDOWN_SECONDS=60
+      - LOG_LEVEL=INFO
+
+    # Mount Docker socket for container management
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/var/log
+
+    # Network mode to access PyMonNet server
+    networks:
+      - swarm-network
+
+    # Deployment configuration for Swarm
+    deploy:
+      mode: replicated
+      replicas: 1 # Change to 3 for HA (one per manager)
+      placement:
+        constraints:
+          # Deploy on manager nodes (control plane)
+          - node.role == manager
+          # Optional: specific manager if you have multiple
+          # - node.hostname == master
+      update_config:
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 128M
+        reservations:
+          cpus: "0.1"
+          memory: 64M
+
+    # Health check
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import requests; requests.get('${PYMONNET_URL}/nodes', timeout=3)",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+    restart: unless-stopped
+
+networks:
+  swarm-network:
+    external: true
+    name: pymonnet-net

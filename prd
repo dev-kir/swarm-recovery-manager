@@ -1,0 +1,656 @@
+# Product Requirements Document (PRD)
+## Rule-Based Proactive Recovery Manager for Docker Swarm
+
+**Document Version:** 1.0  
+**Author:** Amir Muzakkir Bin Md Kamaru Al-Amin  
+**Date:** November 2025  
+**Project:** Final Year Project - UiTM  
+
+---
+
+## 1. Executive Summary
+
+### 1.1 Purpose
+This PRD defines the requirements for a **Rule-Based Proactive Recovery Manager** that enhances Docker Swarm's native fault tolerance by implementing early intervention mechanisms. The system monitors real-time metrics and executes corrective actions **before** complete service failure occurs.
+
+### 1.2 Problem Statement
+Docker Swarm's default recovery mechanism is **purely reactive**:
+- Only restarts containers **after** failure is detected
+- Cannot distinguish between temporary resource spikes and actual failures
+- Lacks contextual awareness of container-level metrics
+- Results in unnecessary restarts (false positives) or delayed recovery
+
+### 1.3 Solution Overview
+A lightweight Python-based recovery engine that:
+- Polls real-time metrics from PyMonNet monitoring system
+- Evaluates rule-based conditions (if-then-else logic)
+- Executes proactive recovery actions via Docker Swarm API
+- Reduces Mean Time to Recovery (MTTR) significantly
+
+---
+
+## 2. System Context
+
+### 2.1 Existing Infrastructure
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    DOCKER SWARM CLUSTER                         │
+├─────────────────────────────────────────────────────────────────┤
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐         │
+│  │   MASTER    │    │  WORKER-1   │    │  WORKER-4   │         │
+│  │  (Manager)  │    │  (Worker)   │    │  (Worker)   │         │
+│  │             │    │             │    │             │         │
+│  │ PyMonNet    │    │ PyMonNet    │    │ PyMonNet    │         │
+│  │ Server      │    │ Agent       │    │ Agent       │         │
+│  │ :6969       │    │             │    │             │         │
+│  └─────────────┘    └─────────────┘    └─────────────┘         │
+│         │                  │                  │                 │
+│         └──────────────────┴──────────────────┘                 │
+│                           │                                     │
+│              ┌────────────▼────────────┐                        │
+│              │   RECOVERY MANAGER      │                        │
+│              │   (This Component)      │                        │
+│              └─────────────────────────┘                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 2.2 Data Sources
+
+#### PyMonNet Server Endpoints
+
+**GET /nodes** - Returns cluster-wide node metrics:
+```json
+{
+  "worker-1": {
+    "cpu": 100.0,
+    "mem": 48.9,
+    "net_in": 0.0765,
+    "net_out": 0.3653,
+    "node": "worker-1",
+    "role": "worker",
+    "status": "high_load",
+    "timestamp": "2025-11-21T03:42:06",
+    "containers": [
+      {
+        "container": "organic-web-stress.1.xxx",
+        "container_id": "814be42d69f2",
+        "cpu": 99.73,
+        "mem": 50.29,
+        "net_in": 0.0,
+        "net_out": 0.0,
+        "timestamp": "2025-11-21T03:41:58"
+      }
+    ]
+  }
+}
+```
+
+#### Available Metrics
+
+| Metric | Type | Description | Unit |
+|--------|------|-------------|------|
+| `cpu` | Node | Total CPU utilization | % (0-100) |
+| `mem` | Node | Memory utilization | % (0-100) |
+| `net_in` | Node | Network ingress | Mbps |
+| `net_out` | Node | Network egress | Mbps |
+| `status` | Node | Health status | "normal" / "high_load" |
+| `timestamp` | Node | Last heartbeat | ISO 8601 |
+| `containers[].cpu` | Container | Container CPU usage | % |
+| `containers[].mem` | Container | Container memory usage | % |
+
+---
+
+## 3. Functional Requirements
+
+### 3.1 Core Functions
+
+#### FR-001: Metric Polling
+- **Description:** Periodically fetch metrics from PyMonNet server
+- **Endpoint:** `GET http://pymonnet-server:6969/nodes`
+- **Frequency:** Configurable (default: 5 seconds)
+- **Timeout:** 3 seconds
+- **Error Handling:** Log failures, continue polling
+
+#### FR-002: Rule Evaluation Engine
+- **Description:** Evaluate metrics against predefined rules
+- **Input:** Node metrics, container metrics, thresholds
+- **Output:** List of triggered rules with recommended actions
+- **Logic:** If-then-else condition matching
+
+#### FR-003: Recovery Action Execution
+- **Description:** Execute recovery actions via Docker SDK
+- **Actions Supported:**
+  - `restart_container` - Restart specific container
+  - `redeploy_service` - Force service update (reschedule)
+  - `scale_service` - Increase/decrease replicas
+  - `drain_node` - Remove node from scheduling
+
+#### FR-004: Cooldown Management
+- **Description:** Prevent repeated actions on same target
+- **Mechanism:** Track last action time per target
+- **Default Cooldown:** 60 seconds (configurable)
+
+#### FR-005: Logging and Auditing
+- **Description:** Record all decisions and actions
+- **Log Format:** JSON with timestamp, rule, target, action, result
+- **Storage:** File-based + optional InfluxDB export
+
+---
+
+### 3.2 Rule Definitions
+
+#### Rule Type A: Node High CPU Load
+```yaml
+rule_id: NODE_CPU_HIGH
+trigger: node.cpu > NODE_CPU_THRESHOLD
+condition: sustained for > 10 seconds
+action:
+  - identify top CPU container
+  - restart_container(container_id)
+threshold: 85%
+```
+
+#### Rule Type B: Node High Memory Load
+```yaml
+rule_id: NODE_MEM_HIGH
+trigger: node.mem > NODE_MEM_THRESHOLD
+condition: sustained for > 10 seconds
+action:
+  - identify top memory container
+  - restart_container(container_id)
+threshold: 90%
+```
+
+#### Rule Type C: Container High CPU
+```yaml
+rule_id: CONTAINER_CPU_HIGH
+trigger: container.cpu > CONTAINER_CPU_THRESHOLD
+condition: immediate
+action:
+  - restart_container(container_id)
+threshold: 95%
+```
+
+#### Rule Type D: Node Stale (Failure Detection)
+```yaml
+rule_id: NODE_STALE
+trigger: now - node.timestamp > STALE_SECONDS
+condition: immediate
+action:
+  - identify services on node
+  - redeploy_service(service_name) for each
+threshold: 30 seconds
+```
+
+#### Rule Type E: Network Congestion + CPU (Horizontal Scaling)
+```yaml
+rule_id: SCALE_UP
+trigger: node.cpu > 80% AND node.net_out > 50 Mbps
+condition: sustained for > 30 seconds
+action:
+  - scale_service(service_name, replicas + 1)
+threshold: cpu=80%, net_out=50
+```
+
+#### Rule Type F: Repeated Failures
+```yaml
+rule_id: REPEATED_FAILURE
+trigger: same container restarted > 3 times in 5 minutes
+condition: count-based
+action:
+  - redeploy_service(service_name) to different node
+threshold: 3 restarts / 5 minutes
+```
+
+---
+
+## 4. Non-Functional Requirements
+
+### 4.1 Performance
+| Metric | Requirement |
+|--------|-------------|
+| Polling Latency | < 100ms per cycle |
+| Rule Evaluation | < 50ms for all rules |
+| Action Execution | < 5 seconds |
+| Memory Footprint | < 50MB RAM |
+| CPU Usage | < 5% average |
+
+### 4.2 Reliability
+- **Availability:** 99.9% uptime
+- **Fault Tolerance:** Graceful degradation on PyMonNet unavailability
+- **Recovery:** Auto-restart on crash (systemd/Docker)
+
+### 4.3 Scalability
+- Support up to 50 nodes
+- Support up to 500 containers
+- Linear scaling of rule evaluation
+
+### 4.4 Security
+- Run with minimum required Docker privileges
+- No sensitive data in logs
+- Environment-based configuration (no hardcoded secrets)
+
+---
+
+## 5. Technical Architecture
+
+### 5.1 Component Diagram
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    RECOVERY MANAGER                          │
+├──────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌────────────────┐    ┌────────────────┐                   │
+│  │  Metric Poller │───▶│  Rule Engine   │                   │
+│  │                │    │                │                   │
+│  │  - HTTP Client │    │  - Threshold   │                   │
+│  │  - Retry Logic │    │    Evaluation  │                   │
+│  │  - Caching     │    │  - Condition   │                   │
+│  └────────────────┘    │    Matching    │                   │
+│                        │  - Priority    │                   │
+│                        │    Ranking     │                   │
+│                        └───────┬────────┘                   │
+│                                │                             │
+│                                ▼                             │
+│  ┌────────────────┐    ┌────────────────┐                   │
+│  │ Cooldown Mgr   │◀──▶│ Action Exec    │                   │
+│  │                │    │                │                   │
+│  │  - Time Track  │    │  - Docker SDK  │                   │
+│  │  - Rate Limit  │    │  - Swarm API   │                   │
+│  │  - Per-Target  │    │  - Error Hand  │                   │
+│  └────────────────┘    └───────┬────────┘                   │
+│                                │                             │
+│                                ▼                             │
+│                        ┌────────────────┐                   │
+│                        │    Logger      │                   │
+│                        │                │                   │
+│                        │  - File Log    │                   │
+│                        │  - InfluxDB    │                   │
+│                        │  - Console     │                   │
+│                        └────────────────┘                   │
+│                                                              │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 Technology Stack
+
+| Component | Technology |
+|-----------|------------|
+| Language | Python 3.10+ |
+| HTTP Client | `requests` or `httpx` |
+| Docker Integration | `docker` SDK for Python |
+| Configuration | `.env` file + environment variables |
+| Logging | Python `logging` + JSON formatter |
+| Scheduling | `asyncio` or `threading` |
+
+### 5.3 Configuration Schema
+
+```bash
+# .env file
+PYMONNET_URL=http://192.168.2.50:6969
+POLL_INTERVAL=5
+DOCKER_SOCKET=/var/run/docker.sock
+
+# Thresholds
+NODE_CPU_THRESHOLD=85
+NODE_MEM_THRESHOLD=90
+CONTAINER_CPU_THRESHOLD=95
+NETWORK_THRESHOLD=50
+STALE_SECONDS=30
+
+# Cooldown
+COOLDOWN_SECONDS=60
+MAX_RESTARTS_BEFORE_REDEPLOY=3
+RESTART_WINDOW_SECONDS=300
+
+# Logging
+LOG_LEVEL=INFO
+LOG_FILE=/var/log/recovery-manager.log
+INFLUXDB_URL=http://localhost:8086
+INFLUXDB_BUCKET=recovery_metrics
+```
+
+---
+
+## 6. Recovery Actions Specification
+
+### 6.1 restart_container
+
+**Purpose:** Restart a specific container that is causing issues
+
+**Implementation:**
+```python
+def restart_container(container_id: str) -> bool:
+    client = docker.from_env()
+    container = client.containers.get(container_id)
+    container.restart(timeout=10)
+    return True
+```
+
+**Docker CLI Equivalent:**
+```bash
+docker restart <container_id>
+```
+
+### 6.2 redeploy_service
+
+**Purpose:** Force Swarm to reschedule service (potentially to different node)
+
+**Implementation:**
+```python
+def redeploy_service(service_name: str) -> bool:
+    client = docker.from_env()
+    service = client.services.get(service_name)
+    service.update(force_update=True)
+    return True
+```
+
+**Docker CLI Equivalent:**
+```bash
+docker service update --force <service_name>
+```
+
+### 6.3 scale_service
+
+**Purpose:** Horizontally scale service replicas
+
+**Implementation:**
+```python
+def scale_service(service_name: str, replicas: int) -> bool:
+    client = docker.from_env()
+    service = client.services.get(service_name)
+    service.scale(replicas)
+    return True
+```
+
+**Docker CLI Equivalent:**
+```bash
+docker service scale <service_name>=<replicas>
+```
+
+### 6.4 drain_node
+
+**Purpose:** Remove node from scheduling (for repeated failures)
+
+**Implementation:**
+```python
+def drain_node(node_id: str) -> bool:
+    client = docker.from_env()
+    node = client.nodes.get(node_id)
+    spec = node.attrs['Spec']
+    spec['Availability'] = 'drain'
+    node.update(spec)
+    return True
+```
+
+**Docker CLI Equivalent:**
+```bash
+docker node update --availability drain <node_id>
+```
+
+---
+
+## 7. Decision Flow
+
+### 7.1 Main Loop Flowchart
+
+```
+┌─────────────────┐
+│     START       │
+└────────┬────────┘
+         │
+         ▼
+┌─────────────────┐
+│  Poll /nodes    │◀─────────────────────┐
+│  from PyMonNet  │                      │
+└────────┬────────┘                      │
+         │                               │
+         ▼                               │
+┌─────────────────┐                      │
+│  Parse Response │                      │
+│  Extract Metrics│                      │
+└────────┬────────┘                      │
+         │                               │
+         ▼                               │
+┌─────────────────┐     ┌──────────┐     │
+│  For each node: │     │ No rules │     │
+│  Evaluate Rules │────▶│ triggered│─────┤
+└────────┬────────┘     └──────────┘     │
+         │                               │
+         │ Rules Triggered               │
+         ▼                               │
+┌─────────────────┐     ┌──────────┐     │
+│  Check Cooldown │────▶│ In       │─────┤
+│  for target     │     │ cooldown │     │
+└────────┬────────┘     └──────────┘     │
+         │                               │
+         │ Not in cooldown               │
+         ▼                               │
+┌─────────────────┐                      │
+│  Execute Action │                      │
+│  (Docker SDK)   │                      │
+└────────┬────────┘                      │
+         │                               │
+         ▼                               │
+┌─────────────────┐                      │
+│  Log Action     │                      │
+│  Update Cooldown│                      │
+└────────┬────────┘                      │
+         │                               │
+         ▼                               │
+┌─────────────────┐                      │
+│  Sleep          │                      │
+│  POLL_INTERVAL  │──────────────────────┘
+└─────────────────┘
+```
+
+### 7.2 Rule Priority
+
+Rules are evaluated in priority order:
+
+| Priority | Rule | Reason |
+|----------|------|--------|
+| 1 | NODE_STALE | Node failure is critical |
+| 2 | REPEATED_FAILURE | Prevent restart loops |
+| 3 | NODE_CPU_HIGH | Node-level issues |
+| 4 | NODE_MEM_HIGH | Node-level issues |
+| 5 | CONTAINER_CPU_HIGH | Container-level issues |
+| 6 | SCALE_UP | Optimization, not critical |
+
+---
+
+## 8. Logging and Metrics
+
+### 8.1 Log Format
+
+```json
+{
+  "timestamp": "2025-11-21T03:42:10.123Z",
+  "level": "INFO",
+  "event": "RECOVERY_ACTION",
+  "rule_id": "NODE_CPU_HIGH",
+  "node": "worker-1",
+  "container": "organic-web-stress.1.xxx",
+  "container_id": "814be42d69f2",
+  "action": "restart_container",
+  "metrics": {
+    "node_cpu": 100.0,
+    "node_mem": 48.9,
+    "container_cpu": 99.73
+  },
+  "result": "success",
+  "duration_ms": 2340
+}
+```
+
+### 8.2 MTTR Metrics Export
+
+For InfluxDB/Grafana visualization:
+
+```
+recovery_action,node=worker-1,action=restart,rule=NODE_CPU_HIGH duration=2340,success=1 1732160530000000000
+```
+
+### 8.3 Key Performance Indicators
+
+| KPI | Target | Measurement |
+|-----|--------|-------------|
+| MTTR (Proactive) | < 10 seconds | Time from threshold breach to recovery |
+| False Positive Rate | < 10% | Unnecessary actions / Total actions |
+| System Uptime | > 99% | Service availability |
+| Detection Latency | < 5 seconds | Time from anomaly to detection |
+
+---
+
+## 9. Testing Requirements
+
+### 9.1 Unit Tests
+- Rule evaluation logic
+- Threshold comparison
+- Cooldown management
+- Docker SDK wrappers
+
+### 9.2 Integration Tests
+- Full polling cycle
+- Action execution on test cluster
+- Multi-node scenarios
+
+### 9.3 Stress Test Scenarios
+
+| Test | Method | Expected Outcome |
+|------|--------|------------------|
+| CPU Spike | `/page-heavy` with high load | Container restart |
+| Memory Exhaustion | Large `mem_mb` parameter | Container restart |
+| Network Saturation | High concurrency + large response | Scaling action |
+| Node Failure | Stop PyMonNet agent | Stale node detection |
+
+---
+
+## 10. Deployment
+
+### 10.1 Docker Compose (Recommended)
+
+```yaml
+version: '3.8'
+services:
+  recovery-manager:
+    image: recovery-manager:latest
+    build: .
+    environment:
+      - PYMONNET_URL=http://pymonnet-server:6969
+      - POLL_INTERVAL=5
+      - NODE_CPU_THRESHOLD=85
+      - NODE_MEM_THRESHOLD=90
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./logs:/var/log
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == manager
+    restart: unless-stopped
+```
+
+### 10.2 Systemd Service
+
+```ini
+[Unit]
+Description=Recovery Manager for Docker Swarm
+After=docker.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/recovery-manager/main.py
+Restart=always
+RestartSec=5
+Environment=PYMONNET_URL=http://localhost:6969
+
+[Install]
+WantedBy=multi-user.target
+```
+
+---
+
+## 11. Success Criteria
+
+### 11.1 Functional Success
+- [ ] Successfully polls PyMonNet metrics every 5 seconds
+- [ ] Correctly identifies high-load nodes and containers
+- [ ] Executes container restart within 5 seconds of detection
+- [ ] Respects cooldown periods
+- [ ] Logs all actions with full context
+
+### 11.2 Performance Success
+- [ ] MTTR reduced by >50% compared to default Swarm behavior
+- [ ] False positive rate < 10%
+- [ ] System uptime > 99% during stress tests
+- [ ] Resource overhead < 5% CPU, < 50MB RAM
+
+### 11.3 FYP Evaluation Metrics
+- [ ] Document baseline MTTR (default Swarm reactive recovery)
+- [ ] Document proactive MTTR (with Recovery Manager)
+- [ ] Compare and analyze improvement percentage
+- [ ] Generate Grafana dashboards showing recovery events
+
+---
+
+## 12. Future Enhancements
+
+### Phase 2 (Post-FYP)
+- Machine learning anomaly detection layer
+- Predictive failure modeling
+- Multi-cluster support
+- Web UI dashboard
+- Webhook notifications (Slack, Email)
+
+### Phase 3
+- Kubernetes support
+- Custom rule DSL
+- A/B testing for rule effectiveness
+- Auto-tuning thresholds
+
+---
+
+## Appendix A: API Reference
+
+### PyMonNet Endpoints Used
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/nodes` | GET | All node metrics + container metrics |
+| `/metrics` | POST | (Agent) Submit node metrics |
+| `/container-metrics` | POST | (Agent) Submit container metrics |
+
+### Docker SDK Methods Used
+
+| Method | Purpose |
+|--------|---------|
+| `client.containers.get()` | Get container by ID |
+| `container.restart()` | Restart container |
+| `client.services.get()` | Get service by name |
+| `service.update(force_update=True)` | Force service redeploy |
+| `service.scale()` | Scale service replicas |
+| `client.nodes.get()` | Get node by ID |
+| `node.update()` | Update node availability |
+
+---
+
+## Appendix B: Glossary
+
+| Term | Definition |
+|------|------------|
+| MTTR | Mean Time to Recovery - average time to restore service |
+| PyMonNet | Custom monitoring system developed for this project |
+| Proactive Recovery | Intervention before complete failure |
+| Reactive Recovery | Intervention after failure is detected |
+| Cooldown | Minimum time between repeated actions on same target |
+| High Load | Status when CPU or Memory exceeds threshold |
+| Stale Node | Node that hasn't reported metrics within threshold |
+
+---
+
+**Document End**
