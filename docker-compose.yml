@@ -17,6 +17,8 @@ services:
       - NODE_MEM_THRESHOLD=90
       - CONTAINER_CPU_THRESHOLD=95
       - COOLDOWN_SECONDS=60
+      - REMOTE_DOCKER_HOSTS=worker-1=tcp://worker-1:2376,worker-2=tcp://worker-2:2376
+      - REMOTE_DOCKER_TLS_VERIFY=false
       - LOG_LEVEL=INFO
 
     # Mount Docker socket for container management

@@ -17,6 +17,24 @@ from enum import Enum
 
 import requests
 import docker
+from docker.tls import TLSConfig
+
+
+def _parse_host_mapping(raw: str) -> dict[str, str]:
+    """Parse env string like 'worker-1=tcp://10.0.0.5:2376,worker-2=tcp://10.0.0.6:2376'."""
+    mapping: dict[str, str] = {}
+    if not raw:
+        return mapping
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry or "=" not in entry:
+            continue
+        node, url = entry.split("=", 1)
+        node = node.strip()
+        url = url.strip()
+        if node and url:
+            mapping[node] = url
+    return mapping
 
 # ============================================================
 # CONFIGURATION (from environment variables)
@@ -42,6 +60,14 @@ class Config:
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE = os.getenv("LOG_FILE", "/var/log/recovery-manager.log")
+    
+    # Remote Docker hosts (for worker nodes)
+    REMOTE_DOCKER_HOSTS = os.getenv("REMOTE_DOCKER_HOSTS", "")
+    REMOTE_DOCKER_TLS_VERIFY = os.getenv("REMOTE_DOCKER_TLS_VERIFY", "false").lower() == "true"
+    REMOTE_DOCKER_CA_CERT = os.getenv("REMOTE_DOCKER_CA_CERT", "/certs/ca.pem")
+    REMOTE_DOCKER_CLIENT_CERT = os.getenv("REMOTE_DOCKER_CLIENT_CERT", "/certs/cert.pem")
+    REMOTE_DOCKER_CLIENT_KEY = os.getenv("REMOTE_DOCKER_CLIENT_KEY", "/certs/key.pem")
+    REMOTE_DOCKER_HOST_MAP = _parse_host_mapping(REMOTE_DOCKER_HOSTS)
 
 # ============================================================
 # LOGGING SETUP
@@ -86,6 +112,61 @@ class ActionType(Enum):
     REDEPLOY_SERVICE = "redeploy_service"
     SCALE_SERVICE = "scale_service"
     DRAIN_NODE = "drain_node"
+
+
+class DockerClientManager:
+    """Handles Docker client connections for local manager and remote worker nodes."""
+    
+    def __init__(self):
+        self.local_client = self._init_local_client()
+        self.remote_clients: dict[str, docker.DockerClient] = {}
+        self._init_remote_clients()
+    
+    def _init_local_client(self) -> Optional[docker.DockerClient]:
+        try:
+            client = docker.from_env()
+            logger.info("Local Docker client initialized successfully")
+            return client
+        except docker.errors.DockerException as e:
+            logger.error(f"Failed to initialize local Docker client: {e}")
+            return None
+    
+    def _init_remote_clients(self):
+        for node, base_url in Config.REMOTE_DOCKER_HOST_MAP.items():
+            client = self._create_remote_client(node, base_url)
+            if client:
+                self.remote_clients[node] = client
+    
+    def _create_remote_client(self, node: str, base_url: str) -> Optional[docker.DockerClient]:
+        tls_config = None
+        if Config.REMOTE_DOCKER_TLS_VERIFY:
+            if not (os.path.exists(Config.REMOTE_DOCKER_CA_CERT) and
+                    os.path.exists(Config.REMOTE_DOCKER_CLIENT_CERT) and
+                    os.path.exists(Config.REMOTE_DOCKER_CLIENT_KEY)):
+                logger.error("TLS verify enabled but certificate files not found")
+                return None
+            tls_config = TLSConfig(
+                client_cert=(Config.REMOTE_DOCKER_CLIENT_CERT, Config.REMOTE_DOCKER_CLIENT_KEY),
+                ca_cert=Config.REMOTE_DOCKER_CA_CERT,
+                verify=True
+            )
+        try:
+            client = docker.DockerClient(base_url=base_url, tls=tls_config)
+            client.ping()
+            logger.info(f"Remote Docker client ready for node {node}",
+                        extra={"extra": {"node": node, "docker_host": base_url}})
+            return client
+        except docker.errors.DockerException as e:
+            logger.error(f"Failed to connect to remote Docker host {base_url} for node {node}: {e}")
+            return None
+    
+    def get_client_for_node(self, node_name: Optional[str]) -> Optional[docker.DockerClient]:
+        if node_name and node_name in self.remote_clients:
+            return self.remote_clients[node_name]
+        return self.local_client
+    
+    def get_local_client(self) -> Optional[docker.DockerClient]:
+        return self.local_client
 
 @dataclass
 class ContainerMetrics:
@@ -399,16 +480,11 @@ class RuleEngine:
 class ActionExecutor:
     def __init__(self, cooldown: CooldownManager):
         self.cooldown = cooldown
-        try:
-            self.docker_client = docker.from_env()
-            logger.info("Docker client initialized successfully")
-        except docker.errors.DockerException as e:
-            logger.error(f"Failed to initialize Docker client: {e}")
-            self.docker_client = None
+        self.client_manager = DockerClientManager()
     
     def execute(self, action: RecoveryAction) -> bool:
-        if not self.docker_client:
-            logger.error("Docker client not available")
+        if not self.client_manager.get_local_client() and not self.client_manager.remote_clients:
+            logger.error("No Docker client available for action execution")
             return False
         
         # Check cooldown
@@ -424,7 +500,7 @@ class ActionExecutor:
         
         try:
             if action.action_type == ActionType.RESTART_CONTAINER:
-                success = self._restart_container(action.target_container)
+                success = self._restart_container(action.target_node, action.target_container)
                 if success:
                     self.cooldown.record_restart(action.target_container)
             
@@ -470,9 +546,16 @@ class ActionExecutor:
                         extra={"extra": {"rule_id": action.rule_id, "error": str(e)}})
             return False
     
-    def _restart_container(self, container_id: str) -> bool:
+    def _restart_container(self, node_name: Optional[str], container_id: str) -> bool:
+        if not container_id:
+            logger.warning("No container ID provided for restart")
+            return False
+        client = self.client_manager.get_client_for_node(node_name)
+        if not client:
+            logger.error(f"No Docker client available for node {node_name}")
+            return False
         try:
-            container = self.docker_client.containers.get(container_id)
+            container = client.containers.get(container_id)
             container.restart(timeout=10)
             return True
         except docker.errors.NotFound:
@@ -486,8 +569,12 @@ class ActionExecutor:
         if not service_name:
             logger.warning("No service name provided for redeploy")
             return False
+        client = self.client_manager.get_local_client()
+        if not client:
+            logger.error("No local Docker client available for redeploy")
+            return False
         try:
-            service = self.docker_client.services.get(service_name)
+            service = client.services.get(service_name)
             service.update(force_update=True)
             return True
         except docker.errors.NotFound:
@@ -500,8 +587,12 @@ class ActionExecutor:
     def _scale_service(self, service_name: str, increment: int = 1) -> bool:
         if not service_name:
             return False
+        client = self.client_manager.get_local_client()
+        if not client:
+            logger.error("No local Docker client available for scale")
+            return False
         try:
-            service = self.docker_client.services.get(service_name)
+            service = client.services.get(service_name)
             current_replicas = service.attrs['Spec']['Mode']['Replicated']['Replicas']
             new_replicas = current_replicas + increment
             service.scale(new_replicas)
@@ -516,7 +607,11 @@ class ActionExecutor:
     
     def _drain_node(self, node_name: str) -> bool:
         try:
-            node = self.docker_client.nodes.get(node_name)
+            client = self.client_manager.get_local_client()
+            if not client:
+                logger.error("No local Docker client available for drain")
+                return False
+            node = client.nodes.get(node_name)
             spec = node.attrs['Spec']
             spec['Availability'] = 'drain'
             node.update(spec)
