@@ -807,15 +807,18 @@ def main():
     """)
     
     print(f"Configuration:")
-    print(f"  PyMonNet URL:     {Config.PYMONNET_URL}")
-    print(f"  Poll Interval:    {Config.POLL_INTERVAL}s")
-    print(f"  CPU Threshold:    {Config.NODE_CPU_THRESHOLD}%")
-    print(f"  Memory Threshold: {Config.NODE_MEM_THRESHOLD}%")
-    print(f"  Cooldown:         {Config.COOLDOWN_SECONDS}s")
+    print(f"  PyMonNet URL:        {Config.PYMONNET_URL}")
+    print(f"  Poll Interval:       {Config.POLL_INTERVAL}s")
+    print(f"  CPU Warning:         {Config.NODE_CPU_WARNING}%")
+    print(f"  CPU Critical:        {Config.NODE_CPU_CRITICAL}%")
+    print(f"  Memory Warning:      {Config.NODE_MEM_WARNING}%")
+    print(f"  Memory Critical:     {Config.NODE_MEM_CRITICAL}%")
+    print(f"  Container CPU:       {Config.CONTAINER_CPU_THRESHOLD}%")
+    print(f"  Network Threshold:   {Config.NETWORK_OUT_THRESHOLD} Mbps")
+    print(f"  Cooldown Restart:    {Config.COOLDOWN_RESTART}s")
+    print(f"  Cooldown Scale:      {Config.COOLDOWN_SCALE}s")
+    print(f"  Cooldown Redeploy:   {Config.COOLDOWN_REDEPLOY}s")
     print()
     
     manager = RecoveryManager()
     manager.run()
-
-if __name__ == "__main__":
-    main()
