@@ -822,3 +822,6 @@ def main():
     
     manager = RecoveryManager()
     manager.run()
+
+if __name__ == "__main__":
+    main()
