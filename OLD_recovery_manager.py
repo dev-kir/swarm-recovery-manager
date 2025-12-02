@@ -14,7 +14,6 @@ from datetime import datetime, timedelta
 from typing import Optional
 from dataclasses import dataclass, field
 from enum import Enum
-from collections import deque  # ADD THIS LINE
 
 import requests
 import docker
@@ -40,49 +39,36 @@ def _parse_host_mapping(raw: str) -> dict[str, str]:
 # ============================================================
 # CONFIGURATION (from environment variables)
 # ============================================================
-# ============================================================
-# CONFIGURATION (OPTIMIZED)
-# ============================================================
 class Config:
     # PyMonNet Server
     PYMONNET_URL = os.getenv("PYMONNET_URL", "http://192.168.2.50:6969")
-    POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))  # FASTER: 2s instead of 5s
+    POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "5"))
     REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "3"))
     
-    # PREDICTIVE Thresholds (act BEFORE critical)
-    NODE_CPU_WARNING = float(os.getenv("NODE_CPU_WARNING", "60"))  # Early warning
-    NODE_CPU_CRITICAL = float(os.getenv("NODE_CPU_CRITICAL", "75"))  # Critical
-    NODE_MEM_WARNING = float(os.getenv("NODE_MEM_WARNING", "70"))
-    NODE_MEM_CRITICAL = float(os.getenv("NODE_MEM_CRITICAL", "85"))
-    CONTAINER_CPU_THRESHOLD = float(os.getenv("CONTAINER_CPU_THRESHOLD", "80"))
-    NETWORK_OUT_THRESHOLD = float(os.getenv("NETWORK_OUT_THRESHOLD", "40"))
-    STALE_SECONDS = int(os.getenv("STALE_SECONDS", "15"))
+    # Thresholds
+    NODE_CPU_THRESHOLD = float(os.getenv("NODE_CPU_THRESHOLD", "85"))
+    NODE_MEM_THRESHOLD = float(os.getenv("NODE_MEM_THRESHOLD", "90"))
+    CONTAINER_CPU_THRESHOLD = float(os.getenv("CONTAINER_CPU_THRESHOLD", "95"))
+    NETWORK_OUT_THRESHOLD = float(os.getenv("NETWORK_OUT_THRESHOLD", "50"))
+    STALE_SECONDS = int(os.getenv("STALE_SECONDS", "30"))
     
-    # SEPARATE Cooldowns for different actions
-    COOLDOWN_RESTART = int(os.getenv("COOLDOWN_RESTART", "30"))
-    COOLDOWN_SCALE = int(os.getenv("COOLDOWN_SCALE", "20"))
-    COOLDOWN_REDEPLOY = int(os.getenv("COOLDOWN_REDEPLOY", "60"))
-    
-    # Restart tracking
-    MAX_RESTARTS_BEFORE_REDEPLOY = int(os.getenv("MAX_RESTARTS_BEFORE_REDEPLOY", "2"))
-    RESTART_WINDOW_SECONDS = int(os.getenv("RESTART_WINDOW_SECONDS", "180"))
-    
-    # Trend detection
-    TREND_WINDOW_SIZE = int(os.getenv("TREND_WINDOW_SIZE", "6"))
-    TREND_INCREASE_THRESHOLD = float(os.getenv("TREND_INCREASE_THRESHOLD", "15"))
+    # Cooldown
+    COOLDOWN_SECONDS = int(os.getenv("COOLDOWN_SECONDS", "60"))
+    MAX_RESTARTS_BEFORE_REDEPLOY = int(os.getenv("MAX_RESTARTS_BEFORE_REDEPLOY", "3"))
+    RESTART_WINDOW_SECONDS = int(os.getenv("RESTART_WINDOW_SECONDS", "300"))
     
     # Logging
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
     LOG_FILE = os.getenv("LOG_FILE", "/var/log/recovery-manager.log")
     
-    # Remote Docker hosts
+    # Remote Docker hosts (for worker nodes)
     REMOTE_DOCKER_HOSTS = os.getenv("REMOTE_DOCKER_HOSTS", "")
     REMOTE_DOCKER_TLS_VERIFY = os.getenv("REMOTE_DOCKER_TLS_VERIFY", "false").lower() == "true"
     REMOTE_DOCKER_CA_CERT = os.getenv("REMOTE_DOCKER_CA_CERT", "/certs/ca.pem")
     REMOTE_DOCKER_CLIENT_CERT = os.getenv("REMOTE_DOCKER_CLIENT_CERT", "/certs/cert.pem")
     REMOTE_DOCKER_CLIENT_KEY = os.getenv("REMOTE_DOCKER_CLIENT_KEY", "/certs/key.pem")
     REMOTE_DOCKER_HOST_MAP = _parse_host_mapping(REMOTE_DOCKER_HOSTS)
-    
+
 # ============================================================
 # LOGGING SETUP
 # ============================================================
@@ -213,7 +199,6 @@ class RecoveryAction:
     target_service: Optional[str]
     reason: str
     metrics: dict
-    priority: int = 1  # Higher number = higher priority
 
 # ============================================================
 # COOLDOWN MANAGER
@@ -222,36 +207,14 @@ class CooldownManager:
     def __init__(self):
         self.last_actions: dict[str, datetime] = {}
         self.restart_counts: dict[str, list[datetime]] = {}
-
-    def can_act(self, target: str, action_type: ActionType = None) -> bool:
-        now = datetime.now()
-		
-		# If action_type is provided, use separate cooldowns
-        if action_type == ActionType.RESTART_CONTAINER:
-            if target not in self.last_actions:
-                return True
-            elapsed = (now - self.last_actions[target]).total_seconds()
-            return elapsed > Config.COOLDOWN_RESTART
-		
-        elif action_type == ActionType.SCALE_SERVICE:
-            if target not in self.last_actions:
-                return True
-            elapsed = (now - self.last_actions[target]).total_seconds()
-            return elapsed > Config.COOLDOWN_SCALE
-		
-        elif action_type == ActionType.REDEPLOY_SERVICE:
-            if target not in self.last_actions:
-                return True
-            elapsed = (now - self.last_actions[target]).total_seconds()
-            return elapsed > Config.COOLDOWN_REDEPLOY
-		
-		# Fallback to old behavior
+    
+    def can_act(self, target: str) -> bool:
         if target not in self.last_actions:
             return True
-        elapsed = (now - self.last_actions[target]).total_seconds()
-        return elapsed > Config.COOLDOWN_RESTART
+        elapsed = datetime.now() - self.last_actions[target]
+        return elapsed.total_seconds() > Config.COOLDOWN_SECONDS
     
-    def record_action(self, target: str, action_type: ActionType = None):
+    def record_action(self, target: str):
         self.last_actions[target] = datetime.now()
     
     def record_restart(self, container_id: str):
@@ -274,73 +237,6 @@ class CooldownManager:
             t for t in self.restart_counts[container_id] if t > cutoff
         ]
         return len(self.restart_counts[container_id])
-    
-# ============================================================
-# TREND TRACKER (NEW)
-# ============================================================
-class TrendTracker:
-    """Track metrics over time to predict issues before they become critical."""
-    
-    def __init__(self):
-        from collections import deque
-        # Store recent metrics: {node_name: deque([cpu1, cpu2, ...])}
-        self.node_cpu_history: dict[str, deque] = {}
-        self.node_mem_history: dict[str, deque] = {}
-        self.service_load_history: dict[str, deque] = {}
-    
-    def update(self, nodes: dict[str, NodeMetrics]):
-        from collections import deque
-        for node_name, node in nodes.items():
-            # Track node CPU
-            if node_name not in self.node_cpu_history:
-                self.node_cpu_history[node_name] = deque(maxlen=Config.TREND_WINDOW_SIZE)
-            self.node_cpu_history[node_name].append(node.cpu)
-            
-            # Track node memory
-            if node_name not in self.node_mem_history:
-                self.node_mem_history[node_name] = deque(maxlen=Config.TREND_WINDOW_SIZE)
-            self.node_mem_history[node_name].append(node.mem)
-            
-            # Track service load (aggregate container CPU)
-            for container in node.containers:
-                service = self._extract_service_name(container.container)
-                if service not in self.service_load_history:
-                    self.service_load_history[service] = deque(maxlen=Config.TREND_WINDOW_SIZE)
-                self.service_load_history[service].append(container.cpu)
-    
-    def is_increasing_rapidly(self, node_name: str, metric_type: str = "cpu") -> bool:
-        """Check if a metric is increasing rapidly."""
-        history = None
-        if metric_type == "cpu":
-            history = self.node_cpu_history.get(node_name)
-        elif metric_type == "mem":
-            history = self.node_mem_history.get(node_name)
-        
-        if not history or len(history) < 3:
-            return False
-        
-        # Calculate trend: compare recent vs older values
-        recent_avg = sum(list(history)[-2:]) / 2
-        older_avg = sum(list(history)[:2]) / 2
-        
-        if older_avg < 10:  # Avoid division by zero and false positives on low load
-            return False
-        
-        increase_pct = ((recent_avg - older_avg) / older_avg) * 100
-        return increase_pct > Config.TREND_INCREASE_THRESHOLD
-    
-    def get_service_trend(self, service_name: str) -> float:
-        """Get average load trend for a service."""
-        if service_name not in self.service_load_history:
-            return 0.0
-        history = self.service_load_history[service_name]
-        if len(history) < 2:
-            return 0.0
-        return sum(history) / len(history)
-    
-    def _extract_service_name(self, container_name: str) -> str:
-        parts = container_name.split(".")
-        return parts[0] if parts else container_name
 
 # ============================================================
 # METRIC POLLER
@@ -593,7 +489,7 @@ class ActionExecutor:
         
         # Check cooldown
         target_key = action.target_container or action.target_service or action.target_node
-        if not self.cooldown.can_act(target_key, action.action_type):
+        if not self.cooldown.can_act(target_key):
             logger.info(f"Action skipped (cooldown): {action.rule_id} on {target_key}",
                        extra={"extra": {"rule_id": action.rule_id, "target": target_key, 
                                        "status": "cooldown"}})
@@ -620,7 +516,7 @@ class ActionExecutor:
             duration_ms = (time.time() - start_time) * 1000
             
             if success:
-                self.cooldown.record_action(target_key, action.action_type)
+                self.cooldown.record_action(target_key)
             
             # Log the action
             log_data = {
@@ -728,14 +624,13 @@ class ActionExecutor:
             return False
 
 # ============================================================
-# MAIN RECOVERY MANAGER (UPDATED) - REPLACE ENTIRE CLASS
+# MAIN RECOVERY MANAGER
 # ============================================================
 class RecoveryManager:
     def __init__(self):
         self.poller = MetricPoller()
         self.cooldown = CooldownManager()
-        self.trend_tracker = TrendTracker()  # NEW: Add trend tracker
-        self.rule_engine = RuleEngine(self.cooldown, self.trend_tracker)  # Pass trend tracker
+        self.rule_engine = RuleEngine(self.cooldown)
         self.executor = ActionExecutor(self.cooldown)
         self.running = True
     
@@ -743,13 +638,9 @@ class RecoveryManager:
         logger.info("Recovery Manager started", extra={"extra": {
             "pymonnet_url": Config.PYMONNET_URL,
             "poll_interval": Config.POLL_INTERVAL,
-            "cpu_warning": Config.NODE_CPU_WARNING,
-            "cpu_critical": Config.NODE_CPU_CRITICAL,
-            "mem_warning": Config.NODE_MEM_WARNING,
-            "mem_critical": Config.NODE_MEM_CRITICAL,
-            "cooldown_restart": Config.COOLDOWN_RESTART,
-            "cooldown_scale": Config.COOLDOWN_SCALE,
-            "cooldown_redeploy": Config.COOLDOWN_REDEPLOY
+            "cpu_threshold": Config.NODE_CPU_THRESHOLD,
+            "mem_threshold": Config.NODE_MEM_THRESHOLD,
+            "cooldown": Config.COOLDOWN_SECONDS
         }})
         
         while self.running:
@@ -772,16 +663,13 @@ class RecoveryManager:
             logger.warning("No metrics received from PyMonNet")
             return
         
-        # Step 2: Update trend tracker
-        self.trend_tracker.update(nodes)
-        
         # Log current cluster state
         high_load_nodes = [n for n, m in nodes.items() if m.status == "high_load"]
         if high_load_nodes:
             logger.info(f"High load detected on nodes: {high_load_nodes}",
                        extra={"extra": {"high_load_nodes": high_load_nodes}})
         
-        # Step 3: Evaluate rules
+        # Step 2: Evaluate rules
         actions = self.rule_engine.evaluate(nodes)
         
         if not actions:
@@ -790,10 +678,10 @@ class RecoveryManager:
         logger.info(f"Rules triggered: {len(actions)} actions pending",
                    extra={"extra": {"action_count": len(actions)}})
         
-        # Step 4: Execute actions (already sorted by priority in rule engine)
+        # Step 3: Execute actions
         for action in actions:
             self.executor.execute(action)
-			
+
 # ============================================================
 # ENTRY POINT
 # ============================================================
