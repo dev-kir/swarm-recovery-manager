@@ -392,8 +392,9 @@ class MetricPoller:
 # RULE ENGINE
 # ============================================================
 class RuleEngine:
-    def __init__(self, cooldown: CooldownManager):
+    def __init__(self, cooldown: CooldownManager, trend_tracker: TrendTracker):
         self.cooldown = cooldown
+        self.trend_tracker = trend_tracker
     
     def evaluate(self, nodes: dict[str, NodeMetrics]) -> list[RecoveryAction]:
         actions = []
