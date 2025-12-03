@@ -404,10 +404,10 @@ class RuleEngine:
             is_manager = node.role == "manager"
             
             # Rule 1: Check for stale node
-            stale_action = self._check_stale_node(node)
-            if stale_action:
-                actions.append(stale_action)
-                continue  # Skip other rules for stale nodes
+            # stale_action = self._check_stale_node(node)
+            # if stale_action:
+            #     actions.append(stale_action)
+            #     continue  # Skip other rules for stale nodes
             
             # Rule 2: Check repeated failures (before other rules)
             repeated_action = self._check_repeated_failures(node)
@@ -435,12 +435,20 @@ class RuleEngine:
                         actions.append(action)
             
             # Rule 6: Scale up (CPU + Network)
-            if (node.cpu > 80 and node.net_out > Config.NETWORK_OUT_THRESHOLD 
-                and not is_manager):
-                action = self._handle_scale_up(node)
-                if action:
-                    actions.append(action)
+            if not is_manager:
+                scale_action = self._handle_scale_up(node)
+                if scale_action:
+                    actions.append(scale_action)
+
+            # if (node.cpu > 80 and node.net_out > Config.NETWORK_OUT_THRESHOLD 
+            #     and not is_manager):
+            #     action = self._handle_scale_up(node)
+            #     if action:
+            #         actions.append(action)
         
+		# ADD THIS LINE - Sort by priority (higher = more important)
+        actions.sort(key=lambda a: a.priority, reverse=True)
+    
         return actions
     
     def _check_stale_node(self, node: NodeMetrics) -> Optional[RecoveryAction]:
@@ -533,23 +541,42 @@ class RuleEngine:
         )
     
     def _handle_scale_up(self, node: NodeMetrics) -> Optional[RecoveryAction]:
+        """AGGRESSIVE SCALING: Scale if CPU > 60% OR Network > 40Mbps"""
+		
+        should_scale = False
+        reason_parts = []
+		
+		# Scale if CPU is high (don't require both conditions!)
+        if node.cpu > Config.NODE_CPU_WARNING:  # 60%
+            should_scale = True
+            reason_parts.append(f"CPU {node.cpu:.1f}%")
+		
+		# OR if network is high
+        if node.net_out > Config.NETWORK_OUT_THRESHOLD:  # 40 Mbps
+            should_scale = True
+            reason_parts.append(f"Network {node.net_out:.1f}Mbps")
+		
+        if not should_scale:
+            return None
+		
         top_container = self._find_top_cpu_container(node)
         if not top_container:
             return None
-        
+		
         service_name = self._extract_service_name(top_container.container)
         return RecoveryAction(
-            rule_id="SCALE_UP",
+            rule_id="PREDICTIVE_SCALE",
             action_type=ActionType.SCALE_SERVICE,
             target_node=node.node,
             target_container=None,
             target_service=service_name,
-            reason=f"High CPU ({node.cpu}%) + High Network ({node.net_out} Mbps)",
+            reason=f"Predictive scale: {', '.join(reason_parts)}",
             metrics={
                 "node_cpu": node.cpu,
                 "node_net_out": node.net_out,
                 "service": service_name
-            }
+            },
+            priority=8  # HIGH PRIORITY - execute before restarts
         )
     
     def _find_top_cpu_container(self, node: NodeMetrics) -> Optional[ContainerMetrics]:
