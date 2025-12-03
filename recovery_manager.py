@@ -416,13 +416,13 @@ class RuleEngine:
                 continue
             
             # Rule 3: Node high CPU
-            if node.cpu > Config.NODE_CPU_THRESHOLD:
+            if node.cpu > Config.NODE_CPU_CRITICAL:
                 action = self._handle_high_cpu(node)
                 if action:
                     actions.append(action)
             
             # Rule 4: Node high memory
-            elif node.mem > Config.NODE_MEM_THRESHOLD:
+            elif node.mem > Config.NODE_MEM_CRITICAL:
                 action = self._handle_high_memory(node)
                 if action:
                     actions.append(action)
@@ -490,7 +490,7 @@ class RuleEngine:
             target_node=node.node,
             target_container=top_container.container_id,
             target_service=self._extract_service_name(top_container.container),
-            reason=f"Node CPU {node.cpu}% > {Config.NODE_CPU_THRESHOLD}%",
+            reason=f"Node CPU {node.cpu}% > {Config.NODE_CPU_CRITICAL}%",
             metrics={
                 "node_cpu": node.cpu,
                 "container": top_container.container,
@@ -509,7 +509,7 @@ class RuleEngine:
             target_node=node.node,
             target_container=top_container.container_id,
             target_service=self._extract_service_name(top_container.container),
-            reason=f"Node Memory {node.mem}% > {Config.NODE_MEM_THRESHOLD}%",
+            reason=f"Node Memory {node.mem}% > {Config.NODE_MEM_CRITICAL}%",
             metrics={
                 "node_mem": node.mem,
                 "container": top_container.container,
