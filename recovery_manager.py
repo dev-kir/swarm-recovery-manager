@@ -439,6 +439,17 @@ class RuleEngine:
                 scale_action = self._handle_scale_up(node)
                 if scale_action:
                     actions.append(scale_action)
+                    
+            if not is_manager:
+                migration_action = self._check_node_migration(node)
+                if migration_action:
+                    actions.append(migration_action)
+        
+            # Existing PREDICTIVE_SCALE check
+            if not is_manager:
+                scale_action = self._handle_scale_up(node)
+                if scale_action:
+                    actions.append(scale_action)
 
             # if (node.cpu > 80 and node.net_out > Config.NETWORK_OUT_THRESHOLD 
             #     and not is_manager):
@@ -605,6 +616,46 @@ class RuleEngine:
         if len(parts) >= 1:
             return parts[0]
         return container_name
+    
+    def _check_node_migration(self, node: NodeMetrics) -> Optional[RecoveryAction]:
+        """
+        Detect node problems vs traffic load:
+        - High CPU + LOW network = node problem → drain node
+        - High CPU + HIGH network = traffic load → already handled by PREDICTIVE_SCALE
+        """
+    
+        # Only check if CPU is critically high
+        if node.cpu < Config.NODE_CPU_CRITICAL:  # 75%
+            return None
+    
+        # Check if network is suspiciously LOW for such high CPU
+        # (Real traffic would cause proportional network usage)
+        if node.net_out < Config.NETWORK_OUT_THRESHOLD * 0.5:  # Less than 20 Mbps
+        
+            # This looks like a node problem, not traffic
+            top_container = self._find_top_cpu_container(node)
+            if not top_container:
+                return None
+        
+            service_name = self._extract_service_name(top_container.container)
+        
+            return RecoveryAction(
+                rule_id="NODE_PROBLEM_MIGRATE",
+                action_type=ActionType.DRAIN_NODE,
+                target_node=node.node,
+                target_container=top_container.container_id,
+                target_service=service_name,
+                reason=f"Suspected node problem: CPU {node.cpu}% but network only {node.net_out:.2f} Mbps",
+                metrics={
+                    "node_cpu": node.cpu,
+                    "node_net_out": node.net_out,
+                    "container": top_container.container,
+                    "container_cpu": top_container.cpu
+                },
+                priority=9  # High priority - between REPEATED_FAILURE and NODE_STALE
+            )
+    
+        return None
 
 # ============================================================
 # ACTION EXECUTOR
