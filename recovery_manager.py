@@ -789,15 +789,35 @@ class ActionExecutor:
             return False
     
     def _drain_node(self, node_name: str) -> bool:
+        """Drain node and schedule automatic restoration."""
         try:
             client = self.client_manager.get_local_client()
             if not client:
                 logger.error("No local Docker client available for drain")
                 return False
+        
             node = client.nodes.get(node_name)
             spec = node.attrs['Spec']
             spec['Availability'] = 'drain'
             node.update(spec)
+        
+            logger.info(f"Node {node_name} drained. Will auto-restore in 5 minutes.")
+        
+            # Schedule auto-restore (in a separate thread)
+            import threading
+            def restore_later():
+                time.sleep(300)  # Wait 5 minutes
+                try:
+                    node = client.nodes.get(node_name)
+                    spec = node.attrs['Spec']
+                    spec['Availability'] = 'active'
+                    node.update(spec)
+                    logger.info(f"Node {node_name} auto-restored to Active")
+                except Exception as e:
+                    logger.error(f"Failed to restore node {node_name}: {e}")
+        
+            threading.Thread(target=restore_later, daemon=True).start()
+        
             return True
         except docker.errors.NotFound:
             logger.warning(f"Node not found: {node_name}")
