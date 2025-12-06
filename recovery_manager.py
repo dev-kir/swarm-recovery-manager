@@ -552,28 +552,39 @@ class RuleEngine:
         )
     
     def _handle_scale_up(self, node: NodeMetrics) -> Optional[RecoveryAction]:
-        """AGGRESSIVE SCALING: Scale if CPU > 60% OR Network > 40Mbps"""
-		
+        """INTELLIGENT SCALING: Scale based on load intensity"""
+
         should_scale = False
         reason_parts = []
-		
-		# Scale if CPU is high (don't require both conditions!)
+        scale_increment = 1  # Default: add 1 replica
+
+		# Calculate load intensity to determine scale amount
         if node.cpu > Config.NODE_CPU_WARNING:  # 60%
             should_scale = True
             reason_parts.append(f"CPU {node.cpu:.1f}%")
-		
+
+            # AGGRESSIVE SCALING: If CPU is very high, scale by 2
+            if node.cpu > 80:
+                scale_increment = 2
+                reason_parts.append("(CRITICAL - scaling +2)")
+
 		# OR if network is high
         if node.net_out > Config.NETWORK_OUT_THRESHOLD:  # 40 Mbps
             should_scale = True
             reason_parts.append(f"Network {node.net_out:.1f}Mbps")
-		
+
+            # AGGRESSIVE SCALING: If network is very high, scale by 2
+            if node.net_out > 80:  # 80 Mbps
+                scale_increment = max(scale_increment, 2)
+                reason_parts.append("(HIGH TRAFFIC - scaling +2)")
+
         if not should_scale:
             return None
-		
+
         top_container = self._find_top_cpu_container(node)
         if not top_container:
             return None
-		
+
         service_name = self._extract_service_name(top_container.container)
         return RecoveryAction(
             rule_id="PREDICTIVE_SCALE",
@@ -581,11 +592,12 @@ class RuleEngine:
             target_node=node.node,
             target_container=None,
             target_service=service_name,
-            reason=f"Predictive scale: {', '.join(reason_parts)}",
+            reason=f"Predictive scale +{scale_increment}: {', '.join(reason_parts)}",
             metrics={
                 "node_cpu": node.cpu,
                 "node_net_out": node.net_out,
-                "service": service_name
+                "service": service_name,
+                "scale_increment": scale_increment
             },
             priority=8  # HIGH PRIORITY - execute before restarts
         )
@@ -691,7 +703,9 @@ class ActionExecutor:
                 success = self._redeploy_service(action.target_service)
             
             elif action.action_type == ActionType.SCALE_SERVICE:
-                success = self._scale_service(action.target_service)
+                # Extract scale_increment from metrics if available
+                increment = action.metrics.get("scale_increment", 1)
+                success = self._scale_service(action.target_service, increment=increment)
             
             elif action.action_type == ActionType.DRAIN_NODE:
                 success = self._drain_node(action.target_node)
