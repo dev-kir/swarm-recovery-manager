@@ -870,7 +870,7 @@ class ActionExecutor:
                     self.cooldown.record_restart(action.target_container, service_name=service_name)
 
             elif action.action_type == ActionType.REDEPLOY_SERVICE:
-                success = self._redeploy_service(action.target_service)
+                success = self._redeploy_service(action.target_service, problematic_node=action.target_node)
 
             elif action.action_type == ActionType.SCALE_SERVICE:
                 # Extract scale_increment from metrics if available
@@ -934,13 +934,15 @@ class ActionExecutor:
             logger.error(f"Docker API error restarting container: {e}")
             return False
     
-    def _redeploy_service(self, service_name: str) -> bool:
+    def _redeploy_service(self, service_name: str, problematic_node: str = None) -> bool:
         """
         ZERO-DOWNTIME REDEPLOY for Scenario 1 (Container Problem):
-        1. Trigger rolling update with proper delays
-        2. New container starts on different node
-        3. Wait for new container to be healthy
-        4. Only then remove old container
+        1. Add placement constraint to EXCLUDE problematic node
+        2. Trigger rolling update with proper delays
+        3. New container starts on DIFFERENT node (not problematic one)
+        4. Wait for new container to be healthy
+        5. Only then remove old container
+        6. Remove placement constraint to allow future deployments on any node
         """
         if not service_name:
             logger.warning("No service name provided for redeploy")
@@ -952,7 +954,34 @@ class ActionExecutor:
         try:
             service = client.services.get(service_name)
 
-            # Configure rolling update with zero-downtime parameters
+            # Step 1: Add placement constraint to EXCLUDE problematic node
+            if problematic_node:
+                logger.info(f"Adding constraint to EXCLUDE {problematic_node} for {service_name}")
+                current_spec = service.attrs['Spec']
+
+                # Get existing constraints or create new list
+                task_template = current_spec.get('TaskTemplate', {})
+                placement = task_template.get('Placement', {})
+                constraints = placement.get('Constraints', [])
+
+                # Add constraint to exclude problematic node
+                exclude_constraint = f"node.hostname != {problematic_node}"
+                if exclude_constraint not in constraints:
+                    constraints.append(exclude_constraint)
+
+                # Update service with new constraint
+                placement['Constraints'] = constraints
+                task_template['Placement'] = placement
+                current_spec['TaskTemplate'] = task_template
+
+                service.update(
+                    version=service.attrs['Version']['Index'],
+                    **current_spec
+                )
+                logger.info(f"Constraint added: {exclude_constraint}")
+                time.sleep(2)  # Brief pause to let constraint apply
+
+            # Step 2: Configure rolling update with zero-downtime parameters
             update_config = {
                 'force_update': True,  # Force new container even if image hasn't changed
                 'update_config': {
@@ -966,7 +995,37 @@ class ActionExecutor:
             }
 
             service.update(**update_config)
-            logger.info(f"Triggered zero-downtime rolling update for {service_name} (start-first strategy)")
+            logger.info(f"Triggered zero-downtime rolling update for {service_name} (start-first, exclude {problematic_node})")
+
+            # Step 3: Wait for new container to be created and old one removed
+            if problematic_node:
+                logger.info("Waiting 20s for new container to be created and old one removed...")
+                time.sleep(20)
+
+                # Step 4: Remove the placement constraint to allow future deployments on any node
+                try:
+                    service = client.services.get(service_name)  # Refresh service object
+                    current_spec = service.attrs['Spec']
+                    task_template = current_spec.get('TaskTemplate', {})
+                    placement = task_template.get('Placement', {})
+                    constraints = placement.get('Constraints', [])
+
+                    # Remove the exclude constraint
+                    exclude_constraint = f"node.hostname != {problematic_node}"
+                    if exclude_constraint in constraints:
+                        constraints.remove(exclude_constraint)
+                        placement['Constraints'] = constraints
+                        task_template['Placement'] = placement
+                        current_spec['TaskTemplate'] = task_template
+
+                        service.update(
+                            version=service.attrs['Version']['Index'],
+                            **current_spec
+                        )
+                        logger.info(f"Constraint removed: {exclude_constraint} (now deployable on any node)")
+                except Exception as e:
+                    logger.warning(f"Failed to remove constraint (non-critical): {e}")
+
             return True
         except docker.errors.NotFound:
             logger.warning(f"Service not found: {service_name}")
