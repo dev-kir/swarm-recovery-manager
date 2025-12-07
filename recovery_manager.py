@@ -342,11 +342,16 @@ class CooldownManager:
         return len(recent)
 
     def get_restart_count(self, container_id: str, service_name: str = None) -> int:
-        """Get restart count within window."""
+        """Get restart count within RESTART_WINDOW_SECONDS."""
         tracking_key = service_name or container_id
         if tracking_key not in self.service_restart_history:
             return 0
-        return len(self.service_restart_history[tracking_key])
+
+        # Filter to only restarts within the configured window
+        now = datetime.now()
+        cutoff = now - timedelta(seconds=Config.RESTART_WINDOW_SECONDS)
+        recent = [t for t in self.service_restart_history[tracking_key] if t > cutoff]
+        return len(recent)
     
 # ============================================================
 # TREND TRACKER (NEW)
@@ -557,17 +562,19 @@ class RuleEngine:
     
     def _check_repeated_failures(self, node: NodeMetrics) -> Optional[RecoveryAction]:
         for container in node.containers:
-            count = self.cooldown.get_restart_count(container.container_id)
+            service_name = self._extract_service_name(container.container)
+            # Check restart count by service name (not container ID)
+            count = self.cooldown.get_restart_count(container.container_id, service_name=service_name)
             if count >= Config.MAX_RESTARTS_BEFORE_REDEPLOY:
-                service_name = self._extract_service_name(container.container)
                 return RecoveryAction(
                     rule_id="REPEATED_FAILURE",
                     action_type=ActionType.REDEPLOY_SERVICE,
                     target_node=node.node,
                     target_container=container.container_id,
                     target_service=service_name,
-                    reason=f"Container restarted {count} times in {Config.RESTART_WINDOW_SECONDS}s",
-                    metrics={"restart_count": count, "container": container.container}
+                    reason=f"Container restarted {count} times in {Config.RESTART_WINDOW_SECONDS}s → escalating to redeploy",
+                    metrics={"restart_count": count, "container": container.container},
+                    priority=100  # Highest priority - this is critical!
                 )
         return None
     
