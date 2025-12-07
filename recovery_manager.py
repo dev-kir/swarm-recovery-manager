@@ -500,6 +500,16 @@ class ActionExecutor:
 
     def execute(self, action: RecoveryAction) -> bool:
         """Execute a recovery action"""
+
+        # Check cooldown BEFORE executing
+        if not self.cooldown.can_act(action.service_name, action.action_type):
+            logger.info(f"Action skipped due to cooldown: {action.action_type.value} for {action.service_name}", extra={
+                "action": action.action_type.value,
+                "service": action.service_name,
+                "reason": "cooldown_active"
+            })
+            return False
+
         logger.info(f"Executing action: {action.action_type.value} for {action.service_name}", extra={
             "action": action.action_type.value,
             "service": action.service_name,
