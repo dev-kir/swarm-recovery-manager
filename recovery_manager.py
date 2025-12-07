@@ -205,20 +205,24 @@ class MetricPoller:
             data = response.json()
 
             nodes = {}
-            for node_data in data.get("nodes", []):
-                containers = [
-                    ContainerMetrics(
-                        container=c["container"],
-                        container_id=c["container_id"],
-                        cpu=c["cpu"],
-                        mem=c["mem"],
-                        net_in=c["net_in"],
-                        net_out=c["net_out"]
-                    )
-                    for c in node_data.get("containers", [])
-                ]
+            # PyMonNet returns flat dict: {"worker-1": {...}, "worker-2": {...}}
+            for node_name, node_data in data.items():
+                # Parse container metrics if available
+                containers = []
+                if "containers" in node_data and isinstance(node_data["containers"], list):
+                    containers = [
+                        ContainerMetrics(
+                            container=c["container"],
+                            container_id=c["container_id"],
+                            cpu=c["cpu"],
+                            mem=c["mem"],
+                            net_in=c["net_in"],
+                            net_out=c["net_out"]
+                        )
+                        for c in node_data["containers"]
+                    ]
 
-                nodes[node_data["node"]] = NodeMetrics(
+                nodes[node_name] = NodeMetrics(
                     node=node_data["node"],
                     role=node_data["role"],
                     cpu=node_data["cpu"],
@@ -229,12 +233,14 @@ class MetricPoller:
                     timestamp=node_data["timestamp"]
                 )
 
+            logger.info(f"Fetched metrics for {len(nodes)} nodes")
             return nodes
         except requests.RequestException as e:
             logger.warning(f"Failed to fetch metrics from PyMonNet: {e}")
             return {}
         except (KeyError, ValueError) as e:
             logger.warning(f"Invalid metrics data format: {e}")
+            logger.error(f"Data received: {data if 'data' in locals() else 'N/A'}")
             return {}
 
 
@@ -316,6 +322,36 @@ class ServiceStateTracker:
         except:
             return {}
 
+    def get_containers_on_node(self, node_name: str) -> List[ContainerMetrics]:
+        """
+        Fetch containers running on a specific node using Docker API
+        Used when PyMonNet doesn't provide container metrics
+        """
+        try:
+            client = self.client_manager.get_client_for_node(node_name)
+            if not client:
+                logger.warning(f"No remote Docker client for {node_name}")
+                return []
+
+            containers_list = client.containers.list()
+            result = []
+
+            for container in containers_list:
+                # Create placeholder metrics (we don't have real CPU/MEM from Docker API without stats)
+                result.append(ContainerMetrics(
+                    container=container.name,
+                    container_id=container.short_id,
+                    cpu=0.0,  # Placeholder - actual value unknown
+                    mem=0.0,  # Placeholder - actual value unknown
+                    net_in=0.0,
+                    net_out=0.0
+                ))
+
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to fetch containers from {node_name}: {e}")
+            return []
+
 
 # ============================================================
 # RULE ENGINE
@@ -329,6 +365,16 @@ class RuleEngine:
 
     def evaluate(self, nodes: Dict[str, NodeMetrics]) -> List[RecoveryAction]:
         actions = []
+
+        # Enrich nodes with container data if missing (when node is stressed but PyMonNet hasn't sent containers yet)
+        for node_name, node in nodes.items():
+            if node.role == "manager":
+                continue
+
+            # If node is stressed but has no container data, fetch from Docker API
+            if (node.cpu > Config.NODE_CPU_CRITICAL or node.mem > Config.NODE_MEM_CRITICAL) and len(node.containers) == 0:
+                logger.info(f"Node {node_name} stressed but no container data - fetching from Docker API")
+                node.containers = self.state_tracker.get_containers_on_node(node_name)
 
         # Group containers by service
         service_containers = defaultdict(list)
