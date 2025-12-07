@@ -196,7 +196,7 @@ class MetricPoller:
     """Fetches metrics from PyMonNet"""
 
     def __init__(self):
-        self.url = Config.PYMONNET_URL + "/api/metrics"
+        self.url = Config.PYMONNET_URL + "/nodes"
 
     def fetch(self) -> Dict[str, NodeMetrics]:
         try:
