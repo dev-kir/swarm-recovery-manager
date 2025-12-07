@@ -216,64 +216,137 @@ class RecoveryAction:
     priority: int = 1  # Higher number = higher priority
 
 # ============================================================
-# COOLDOWN MANAGER
+# SMART ADAPTIVE COOLDOWN MANAGER
 # ============================================================
 class CooldownManager:
-    def __init__(self):
-        self.last_actions: dict[str, datetime] = {}
-        self.restart_counts: dict[str, list[datetime]] = {}
+    """
+    Intelligent cooldown that adapts to situation instead of blind time-based waiting.
 
-    def can_act(self, target: str, action_type: ActionType = None) -> bool:
+    Features:
+    1. Service-level tracking (not container ID) - allows new containers to be checked
+    2. Health-aware: skips cooldown if container is already different/unhealthy
+    3. Adaptive cooldown: reduces cooldown if problem persists
+    4. Restart loop detection: prevents infinite restart cycles
+    """
+
+    def __init__(self):
+        # Track by SERVICE name, not container ID
+        self.service_last_action: dict[str, datetime] = {}
+        self.service_restart_history: dict[str, list[datetime]] = {}
+        self.service_last_container: dict[str, str] = {}  # Track which container was last restarted
+
+    def can_act(self, target: str, action_type: ActionType = None,
+                service_name: str = None, container_id: str = None,
+                container_healthy: bool = None) -> tuple[bool, str]:
+        """
+        Smart decision on whether to act.
+
+        Returns: (can_act: bool, reason: str)
+        """
         now = datetime.now()
-		
-		# If action_type is provided, use separate cooldowns
+
+        # Use service name for tracking, not container/node ID
+        tracking_key = service_name or target
+
+        # RULE 1: If this is a DIFFERENT container than last time, allow immediately!
+        # (Container was restarted, now checking the new container)
+        if container_id and tracking_key in self.service_last_container:
+            if self.service_last_container[tracking_key] != container_id:
+                return (True, "different_container")
+
+        # RULE 2: If container is unhealthy/not running, skip cooldown
+        if container_healthy is False:
+            return (True, "container_unhealthy")
+
+        # RULE 3: Check restart loop protection
+        restart_count = self._get_recent_restart_count(tracking_key)
+
+        # If restarted 3+ times in last 60 seconds, prevent restart loop
+        if restart_count >= 3:
+            if action_type == ActionType.RESTART_CONTAINER:
+                # Too many restarts → should escalate to redeploy instead
+                return (False, f"restart_loop_detected_{restart_count}_restarts")
+
+        # RULE 4: Adaptive cooldown based on restart history
+        if tracking_key not in self.service_last_action:
+            return (True, "first_action")
+
+        elapsed = (now - self.service_last_action[tracking_key]).total_seconds()
+
+        # Adaptive cooldown: reduce cooldown if problem persists
+        if restart_count == 0:
+            # First restart → use full cooldown
+            required_cooldown = self._get_cooldown_for_action(action_type)
+        elif restart_count == 1:
+            # Second restart → reduce cooldown by 50%
+            required_cooldown = self._get_cooldown_for_action(action_type) * 0.5
+        elif restart_count == 2:
+            # Third restart → minimal cooldown (5s)
+            required_cooldown = 5
+        else:
+            # 3+ restarts → blocked by RULE 3 above
+            required_cooldown = 999999
+
+        if elapsed > required_cooldown:
+            return (True, f"cooldown_expired_{elapsed:.1f}s")
+        else:
+            remaining = required_cooldown - elapsed
+            return (False, f"cooldown_active_{remaining:.1f}s_remaining")
+
+    def _get_cooldown_for_action(self, action_type: ActionType) -> float:
+        """Get base cooldown for action type."""
         if action_type == ActionType.RESTART_CONTAINER:
-            if target not in self.last_actions:
-                return True
-            elapsed = (now - self.last_actions[target]).total_seconds()
-            return elapsed > Config.COOLDOWN_RESTART
-		
+            return Config.COOLDOWN_RESTART
         elif action_type == ActionType.SCALE_SERVICE:
-            if target not in self.last_actions:
-                return True
-            elapsed = (now - self.last_actions[target]).total_seconds()
-            return elapsed > Config.COOLDOWN_SCALE
-		
+            return Config.COOLDOWN_SCALE
         elif action_type == ActionType.REDEPLOY_SERVICE:
-            if target not in self.last_actions:
-                return True
-            elapsed = (now - self.last_actions[target]).total_seconds()
-            return elapsed > Config.COOLDOWN_REDEPLOY
-		
-		# Fallback to old behavior
-        if target not in self.last_actions:
-            return True
-        elapsed = (now - self.last_actions[target]).total_seconds()
-        return elapsed > Config.COOLDOWN_RESTART
-    
-    def record_action(self, target: str, action_type: ActionType = None):
-        self.last_actions[target] = datetime.now()
-    
-    def record_restart(self, container_id: str):
+            return Config.COOLDOWN_REDEPLOY
+        else:
+            return Config.COOLDOWN_RESTART
+
+    def record_action(self, target: str, action_type: ActionType = None,
+                     service_name: str = None, container_id: str = None):
+        """Record that an action was taken."""
+        tracking_key = service_name or target
+        self.service_last_action[tracking_key] = datetime.now()
+
+        # Remember which container we acted on
+        if container_id:
+            self.service_last_container[tracking_key] = container_id
+
+    def record_restart(self, container_id: str, service_name: str = None):
+        """Record a restart in history."""
+        tracking_key = service_name or container_id
         now = datetime.now()
-        if container_id not in self.restart_counts:
-            self.restart_counts[container_id] = []
-        self.restart_counts[container_id].append(now)
-        # Clean old entries
+
+        if tracking_key not in self.service_restart_history:
+            self.service_restart_history[tracking_key] = []
+
+        self.service_restart_history[tracking_key].append(now)
+
+        # Clean old entries (older than 3 minutes)
         cutoff = now - timedelta(seconds=Config.RESTART_WINDOW_SECONDS)
-        self.restart_counts[container_id] = [
-            t for t in self.restart_counts[container_id] if t > cutoff
+        self.service_restart_history[tracking_key] = [
+            t for t in self.service_restart_history[tracking_key] if t > cutoff
         ]
-    
-    def get_restart_count(self, container_id: str) -> int:
-        if container_id not in self.restart_counts:
+
+    def _get_recent_restart_count(self, tracking_key: str) -> int:
+        """Get number of recent restarts."""
+        if tracking_key not in self.service_restart_history:
             return 0
+
         now = datetime.now()
-        cutoff = now - timedelta(seconds=Config.RESTART_WINDOW_SECONDS)
-        self.restart_counts[container_id] = [
-            t for t in self.restart_counts[container_id] if t > cutoff
-        ]
-        return len(self.restart_counts[container_id])
+        cutoff = now - timedelta(seconds=60)  # Last 60 seconds
+
+        recent = [t for t in self.service_restart_history[tracking_key] if t > cutoff]
+        return len(recent)
+
+    def get_restart_count(self, container_id: str, service_name: str = None) -> int:
+        """Get restart count within window."""
+        tracking_key = service_name or container_id
+        if tracking_key not in self.service_restart_history:
+            return 0
+        return len(self.service_restart_history[tracking_key])
     
 # ============================================================
 # TREND TRACKER (NEW)
@@ -681,14 +754,40 @@ class ActionExecutor:
         if not self.client_manager.get_local_client() and not self.client_manager.remote_clients:
             logger.error("No Docker client available for action execution")
             return False
-        
-        # Check cooldown
+
+        # Smart cooldown check with context
         target_key = action.target_container or action.target_service or action.target_node
-        if not self.cooldown.can_act(target_key, action.action_type):
-            logger.info(f"Action skipped (cooldown): {action.rule_id} on {target_key}",
-                       extra={"extra": {"rule_id": action.rule_id, "target": target_key, 
-                                       "status": "cooldown"}})
+
+        # Extract service name from container name (e.g., "organic-web-stress.1.abc123" → "organic-web-stress")
+        service_name = action.target_service
+        if not service_name and action.target_container:
+            # Try to extract from container name
+            parts = action.target_container.split('.')
+            if len(parts) >= 2:
+                service_name = parts[0]
+
+        # Check if container is healthy (we'll enhance this later with actual health checks)
+        container_healthy = None  # Unknown for now
+
+        can_act, reason = self.cooldown.can_act(
+            target_key,
+            action_type=action.action_type,
+            service_name=service_name,
+            container_id=action.target_container,
+            container_healthy=container_healthy
+        )
+
+        if not can_act:
+            logger.info(f"Action skipped: {action.rule_id} on {service_name or target_key}",
+                       extra={"extra": {"rule_id": action.rule_id, "target": target_key,
+                                       "service": service_name, "reason": reason}})
             return False
+
+        # Log why we're allowing action
+        if reason != "first_action":
+            logger.info(f"Action allowed: {reason}",
+                       extra={"extra": {"rule_id": action.rule_id, "service": service_name,
+                                       "reason": reason}})
         
         start_time = time.time()
         success = False
@@ -697,23 +796,25 @@ class ActionExecutor:
             if action.action_type == ActionType.RESTART_CONTAINER:
                 success = self._restart_container(action.target_node, action.target_container)
                 if success:
-                    self.cooldown.record_restart(action.target_container)
-            
+                    self.cooldown.record_restart(action.target_container, service_name=service_name)
+
             elif action.action_type == ActionType.REDEPLOY_SERVICE:
                 success = self._redeploy_service(action.target_service)
-            
+
             elif action.action_type == ActionType.SCALE_SERVICE:
                 # Extract scale_increment from metrics if available
                 increment = action.metrics.get("scale_increment", 1)
                 success = self._scale_service(action.target_service, increment=increment)
-            
+
             elif action.action_type == ActionType.DRAIN_NODE:
                 success = self._drain_node(action.target_node)
-            
+
             duration_ms = (time.time() - start_time) * 1000
-            
+
             if success:
-                self.cooldown.record_action(target_key, action.action_type)
+                self.cooldown.record_action(target_key, action.action_type,
+                                           service_name=service_name,
+                                           container_id=action.target_container)
             
             # Log the action
             log_data = {
