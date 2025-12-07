@@ -495,7 +495,7 @@ class RuleEngine:
                     actions.append(action)
             
             # Rule 4: Node high memory
-            elif node.mem > Config.NODE_MEM_CRITICAL:
+            if node.mem > Config.NODE_MEM_CRITICAL:
                 action = self._handle_high_memory(node)
                 if action:
                     actions.append(action)
