@@ -982,19 +982,25 @@ class ActionExecutor:
                 time.sleep(2)  # Brief pause to let constraint apply
 
             # Step 2: Configure rolling update with zero-downtime parameters
-            update_config = {
-                'force_update': True,  # Force new container even if image hasn't changed
-                'update_config': {
-                    'parallelism': 1,  # Update 1 container at a time
-                    'delay': 10_000_000_000,  # 10 second delay between updates (nanoseconds)
-                    'failure_action': 'rollback',  # Rollback if new container fails
-                    'monitor': 15_000_000_000,  # Monitor for 15 seconds before considering stable
-                    'max_failure_ratio': 0.0,  # Don't tolerate any failures
-                    'order': 'start-first'  # START new container BEFORE stopping old one (ZERO DOWNTIME!)
-                }
+            # Refresh service to get latest version
+            service = client.services.get(service_name)
+            current_spec = service.attrs['Spec']
+
+            # Update the UpdateConfig in the spec
+            current_spec['UpdateConfig'] = {
+                'Parallelism': 1,  # Update 1 container at a time
+                'Delay': 10_000_000_000,  # 10 second delay between updates (nanoseconds)
+                'FailureAction': 'rollback',  # Rollback if new container fails
+                'Monitor': 15_000_000_000,  # Monitor for 15 seconds before considering stable
+                'MaxFailureRatio': 0.0,  # Don't tolerate any failures
+                'Order': 'start-first'  # START new container BEFORE stopping old one (ZERO DOWNTIME!)
             }
 
-            service.update(**update_config)
+            service.update(
+                version=service.attrs['Version']['Index'],
+                force_update=True,
+                **current_spec
+            )
             logger.info(f"Triggered zero-downtime rolling update for {service_name} (start-first, exclude {problematic_node})")
 
             # Step 3: Wait for new container to be created and old one removed
