@@ -569,9 +569,12 @@ class ActionExecutor:
 
             placement['Constraints'] = constraints
             task_template['Placement'] = placement
-            current_spec['TaskTemplate'] = task_template
 
-            service.update(version=service.attrs['Version']['Index'], **current_spec)
+            # Update service with only the task template
+            service.update(
+                task_template=task_template,
+                version=service.attrs['Version']['Index']
+            )
             logger.info(f"Constraint added: {exclude_constraint}")
             time.sleep(2)
 
@@ -602,8 +605,12 @@ class ActionExecutor:
                 constraints.remove(exclude_constraint)
                 placement['Constraints'] = constraints
                 task_template['Placement'] = placement
-                current_spec['TaskTemplate'] = task_template
-                service.update(version=service.attrs['Version']['Index'], **current_spec)
+
+                # Update service with only the task template
+                service.update(
+                    task_template=task_template,
+                    version=service.attrs['Version']['Index']
+                )
                 logger.info(f"Constraint removed: {exclude_constraint}")
 
             logger.info(f"Migration completed for {service_name}")
