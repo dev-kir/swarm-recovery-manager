@@ -600,8 +600,16 @@ class RuleEngine:
     def _handle_high_memory(self, node: NodeMetrics) -> Optional[RecoveryAction]:
         top_container = self._find_top_memory_container(node)
         if not top_container:
+            # Debug: why can't we find a container?
+            logger.warning(f"NODE_MEM_HIGH triggered but no container found on {node.node}",
+                         extra={"extra": {
+                             "node": node.node,
+                             "node_mem": node.mem,
+                             "container_count": len(node.containers),
+                             "containers": [c.container for c in node.containers]
+                         }})
             return None
-        
+
         return RecoveryAction(
             rule_id="NODE_MEM_HIGH",
             action_type=ActionType.RESTART_CONTAINER,
@@ -999,8 +1007,11 @@ class RecoveryManager:
         # Log current cluster state
         high_load_nodes = [n for n, m in nodes.items() if m.status == "high_load"]
         if high_load_nodes:
+            # Debug: show actual metrics for high load nodes
+            metrics_detail = {n: {"cpu": nodes[n].cpu, "mem": nodes[n].mem, "containers": len(nodes[n].containers)}
+                            for n in high_load_nodes}
             logger.info(f"High load detected on nodes: {high_load_nodes}",
-                       extra={"extra": {"high_load_nodes": high_load_nodes}})
+                       extra={"extra": {"high_load_nodes": high_load_nodes, "metrics": metrics_detail}})
         
         # Step 3: Evaluate rules
         actions = self.rule_engine.evaluate(nodes)
