@@ -214,6 +214,7 @@ class RecoveryAction:
     reason: str
     metrics: dict
     priority: int = 1  # Higher number = higher priority
+    scale_increment: int = 1  # How many replicas to add when scaling up
 
 # ============================================================
 # SMART ADAPTIVE COOLDOWN MANAGER
