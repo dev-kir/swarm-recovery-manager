@@ -556,63 +556,22 @@ class ActionExecutor:
 
             logger.info(f"Starting migration for {service_name} from {problematic_node}")
 
-            # Step 1: Add placement constraint to exclude problematic node
-            logger.info(f"Step 1: Adding constraint to EXCLUDE {problematic_node}")
-            current_spec = service.attrs['Spec']
-            task_template = current_spec.get('TaskTemplate', {})
-            placement = task_template.get('Placement', {})
-            constraints = placement.get('Constraints', [])
+            # Trigger rolling update with zero-downtime settings
+            # This forces Docker to recreate the container on a different node
+            update_config = {
+                'force_update': True,
+                'update_config': {
+                    'parallelism': 1,
+                    'delay': 10_000_000_000,  # 10 seconds (nanoseconds)
+                    'failure_action': 'rollback',
+                    'monitor': 15_000_000_000,  # 15 seconds
+                    'max_failure_ratio': 0.0,
+                    'order': 'start-first'  # Start new before stopping old (ZERO DOWNTIME)
+                }
+            }
 
-            exclude_constraint = f"node.hostname != {problematic_node}"
-            if exclude_constraint not in constraints:
-                constraints.append(exclude_constraint)
-
-            placement['Constraints'] = constraints
-            task_template['Placement'] = placement
-
-            # Update service with only the task template
-            service.update(
-                task_template=task_template,
-                version=service.attrs['Version']['Index']
-            )
-            logger.info(f"Constraint added: {exclude_constraint}")
-            time.sleep(2)
-
-            # Step 2: Scale up by 1 to create new container on different node
-            logger.info(f"Step 2: Scaling up from {original_replicas} to {original_replicas + 1}")
-            service = client.services.get(service_name)  # Refresh
-            service.scale(original_replicas + 1)
-
-            # Step 3: Wait for new container to be running
-            logger.info("Step 3: Waiting for new container to start (20s)")
-            time.sleep(20)
-
-            # Step 4: Scale back down to original replicas (removes old container)
-            logger.info(f"Step 4: Scaling back down to {original_replicas}")
-            service = client.services.get(service_name)  # Refresh
-            service.scale(original_replicas)
-
-            # Step 5: Remove the placement constraint
-            logger.info("Step 5: Removing placement constraint")
-            time.sleep(5)
-            service = client.services.get(service_name)  # Refresh
-            current_spec = service.attrs['Spec']
-            task_template = current_spec.get('TaskTemplate', {})
-            placement = task_template.get('Placement', {})
-            constraints = placement.get('Constraints', [])
-
-            if exclude_constraint in constraints:
-                constraints.remove(exclude_constraint)
-                placement['Constraints'] = constraints
-                task_template['Placement'] = placement
-
-                # Update service with only the task template
-                service.update(
-                    task_template=task_template,
-                    version=service.attrs['Version']['Index']
-                )
-                logger.info(f"Constraint removed: {exclude_constraint}")
-
+            service.update(**update_config)
+            logger.info(f"Triggered zero-downtime migration for {service_name} (start-first strategy)")
             logger.info(f"Migration completed for {service_name}")
             return True
 
