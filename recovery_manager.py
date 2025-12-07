@@ -585,19 +585,20 @@ class RuleEngine:
 
         service_name = self._extract_service_name(top_container.container)
 
-        # ZERO-DOWNTIME STRATEGY: Use rolling update instead of restart
+        # TRUE ZERO-DOWNTIME STRATEGY: SCALE UP instead of redeploy
         return RecoveryAction(
             rule_id="NODE_CPU_HIGH",
-            action_type=ActionType.REDEPLOY_SERVICE,  # Changed from RESTART to REDEPLOY
+            action_type=ActionType.SCALE_SERVICE,  # SCALE instead of REDEPLOY for true zero-downtime
             target_node=node.node,
             target_container=top_container.container_id,
             target_service=service_name,
-            reason=f"Node CPU {node.cpu}% > {Config.NODE_CPU_CRITICAL}% → zero-downtime rolling update",
+            reason=f"Node CPU {node.cpu}% > {Config.NODE_CPU_CRITICAL}% → scale up for zero-downtime recovery",
             metrics={
                 "node_cpu": node.cpu,
                 "container": top_container.container,
                 "container_cpu": top_container.cpu
-            }
+            },
+            scale_increment=1  # Add 1 new container
         )
     
     def _handle_high_memory(self, node: NodeMetrics) -> Optional[RecoveryAction]:
@@ -615,24 +616,25 @@ class RuleEngine:
 
         service_name = self._extract_service_name(top_container.container)
 
-        # ZERO-DOWNTIME STRATEGY:
-        # Instead of restarting (causes downtime), REDEPLOY the service
-        # This creates a NEW container first, waits for it to be healthy,
-        # then removes the old degraded container
-        # Result: Zero downtime because new container handles traffic during transition
+        # TRUE ZERO-DOWNTIME STRATEGY:
+        # SCALE UP instead of redeploy - adds new container WITHOUT removing old one first
+        # New container starts → becomes healthy → handles traffic
+        # Old container can be removed later (or will OOM and Swarm cleans it up)
+        # Result: ZERO downtime because service always has at least 1 healthy container!
 
         return RecoveryAction(
             rule_id="NODE_MEM_HIGH",
-            action_type=ActionType.REDEPLOY_SERVICE,  # Changed from RESTART to REDEPLOY
+            action_type=ActionType.SCALE_SERVICE,  # SCALE instead of REDEPLOY for true zero-downtime
             target_node=node.node,
             target_container=top_container.container_id,
             target_service=service_name,
-            reason=f"Node Memory {node.mem}% > {Config.NODE_MEM_CRITICAL}% → zero-downtime rolling update",
+            reason=f"Node Memory {node.mem}% > {Config.NODE_MEM_CRITICAL}% → scale up for zero-downtime recovery",
             metrics={
                 "node_mem": node.mem,
                 "container": top_container.container,
                 "container_mem": top_container.mem
-            }
+            },
+            scale_increment=1  # Add 1 new container
         )
     
     def _handle_container_high_cpu(self, node: NodeMetrics, 
