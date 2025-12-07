@@ -580,32 +580,60 @@ class RuleEngine:
         return None
     
     def _handle_high_cpu(self, node: NodeMetrics) -> Optional[RecoveryAction]:
+        """
+        SCENARIO DETECTION:
+        - If CPU+MEM high but Network LOW → Container problem (Scenario 1)
+        - If CPU+MEM+Network ALL high → High traffic (Scenario 2)
+        """
         top_container = self._find_top_cpu_container(node)
         if not top_container:
             return None
 
         service_name = self._extract_service_name(top_container.container)
 
-        # TRUE ZERO-DOWNTIME STRATEGY: SCALE UP instead of redeploy
-        return RecoveryAction(
-            rule_id="NODE_CPU_HIGH",
-            action_type=ActionType.SCALE_SERVICE,  # SCALE instead of REDEPLOY for true zero-downtime
-            target_node=node.node,
-            target_container=top_container.container_id,
-            target_service=service_name,
-            reason=f"Node CPU {node.cpu}% > {Config.NODE_CPU_CRITICAL}% → scale up for zero-downtime recovery",
-            metrics={
-                "node_cpu": node.cpu,
-                "container": top_container.container,
-                "container_cpu": top_container.cpu
-            },
-            scale_increment=1  # Add 1 new container
-        )
-    
+        # Check if network is also high
+        network_high = node.net_out > Config.NETWORK_OUT_THRESHOLD
+
+        if network_high:
+            # SCENARIO 2: High traffic → Scale up by adding 1 container
+            return RecoveryAction(
+                rule_id="HIGH_TRAFFIC_SCALE",
+                action_type=ActionType.SCALE_SERVICE,
+                target_node=node.node,
+                target_container=top_container.container_id,
+                target_service=service_name,
+                reason=f"High traffic detected (CPU {node.cpu}%, Net {node.net_out:.1f}Mbps) → scale +1",
+                metrics={
+                    "node_cpu": node.cpu,
+                    "node_net": node.net_out,
+                    "scenario": "high_traffic"
+                },
+                scale_increment=1
+            )
+        else:
+            # SCENARIO 1: Container problem → Redeploy to different node (replace, don't add)
+            return RecoveryAction(
+                rule_id="CONTAINER_PROBLEM",
+                action_type=ActionType.REDEPLOY_SERVICE,
+                target_node=node.node,
+                target_container=top_container.container_id,
+                target_service=service_name,
+                reason=f"Container problem detected (CPU {node.cpu}%, Net LOW) → redeploy to new node",
+                metrics={
+                    "node_cpu": node.cpu,
+                    "container_cpu": top_container.cpu,
+                    "scenario": "container_problem"
+                }
+            )
+
     def _handle_high_memory(self, node: NodeMetrics) -> Optional[RecoveryAction]:
+        """
+        SCENARIO DETECTION:
+        - If CPU+MEM high but Network LOW → Container problem (Scenario 1)
+        - If CPU+MEM+Network ALL high → High traffic (Scenario 2)
+        """
         top_container = self._find_top_memory_container(node)
         if not top_container:
-            # Debug: why can't we find a container?
             logger.warning(f"NODE_MEM_HIGH triggered but no container found on {node.node}",
                          extra={"extra": {
                              "node": node.node,
@@ -617,26 +645,40 @@ class RuleEngine:
 
         service_name = self._extract_service_name(top_container.container)
 
-        # TRUE ZERO-DOWNTIME STRATEGY:
-        # SCALE UP instead of redeploy - adds new container WITHOUT removing old one first
-        # New container starts → becomes healthy → handles traffic
-        # Old container can be removed later (or will OOM and Swarm cleans it up)
-        # Result: ZERO downtime because service always has at least 1 healthy container!
+        # Check if network is also high
+        network_high = node.net_out > Config.NETWORK_OUT_THRESHOLD
 
-        return RecoveryAction(
-            rule_id="NODE_MEM_HIGH",
-            action_type=ActionType.SCALE_SERVICE,  # SCALE instead of REDEPLOY for true zero-downtime
-            target_node=node.node,
-            target_container=top_container.container_id,
-            target_service=service_name,
-            reason=f"Node Memory {node.mem}% > {Config.NODE_MEM_CRITICAL}% → scale up for zero-downtime recovery",
-            metrics={
-                "node_mem": node.mem,
-                "container": top_container.container,
-                "container_mem": top_container.mem
-            },
-            scale_increment=1  # Add 1 new container
-        )
+        if network_high:
+            # SCENARIO 2: High traffic → Scale up by adding 1 container
+            return RecoveryAction(
+                rule_id="HIGH_TRAFFIC_SCALE",
+                action_type=ActionType.SCALE_SERVICE,
+                target_node=node.node,
+                target_container=top_container.container_id,
+                target_service=service_name,
+                reason=f"High traffic detected (MEM {node.mem}%, Net {node.net_out:.1f}Mbps) → scale +1",
+                metrics={
+                    "node_mem": node.mem,
+                    "node_net": node.net_out,
+                    "scenario": "high_traffic"
+                },
+                scale_increment=1
+            )
+        else:
+            # SCENARIO 1: Container problem → Redeploy to different node (replace, don't add)
+            return RecoveryAction(
+                rule_id="CONTAINER_PROBLEM",
+                action_type=ActionType.REDEPLOY_SERVICE,
+                target_node=node.node,
+                target_container=top_container.container_id,
+                target_service=service_name,
+                reason=f"Container problem detected (MEM {node.mem}%, Net LOW) → redeploy to new node",
+                metrics={
+                    "node_mem": node.mem,
+                    "container_mem": top_container.mem,
+                    "scenario": "container_problem"
+                }
+            )
     
     def _handle_container_high_cpu(self, node: NodeMetrics, 
                                     container: ContainerMetrics) -> Optional[RecoveryAction]:
@@ -893,6 +935,13 @@ class ActionExecutor:
             return False
     
     def _redeploy_service(self, service_name: str) -> bool:
+        """
+        ZERO-DOWNTIME REDEPLOY for Scenario 1 (Container Problem):
+        1. Trigger rolling update with proper delays
+        2. New container starts on different node
+        3. Wait for new container to be healthy
+        4. Only then remove old container
+        """
         if not service_name:
             logger.warning("No service name provided for redeploy")
             return False
@@ -902,7 +951,22 @@ class ActionExecutor:
             return False
         try:
             service = client.services.get(service_name)
-            service.update(force_update=True)
+
+            # Configure rolling update with zero-downtime parameters
+            update_config = {
+                'force_update': True,  # Force new container even if image hasn't changed
+                'update_config': {
+                    'parallelism': 1,  # Update 1 container at a time
+                    'delay': 10_000_000_000,  # 10 second delay between updates (nanoseconds)
+                    'failure_action': 'rollback',  # Rollback if new container fails
+                    'monitor': 15_000_000_000,  # Monitor for 15 seconds before considering stable
+                    'max_failure_ratio': 0.0,  # Don't tolerate any failures
+                    'order': 'start-first'  # START new container BEFORE stopping old one (ZERO DOWNTIME!)
+                }
+            }
+
+            service.update(**update_config)
+            logger.info(f"Triggered zero-downtime rolling update for {service_name} (start-first strategy)")
             return True
         except docker.errors.NotFound:
             logger.warning(f"Service not found: {service_name}")
