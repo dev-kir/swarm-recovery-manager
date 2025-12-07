@@ -51,9 +51,9 @@ class Config:
     
     # PREDICTIVE Thresholds (act BEFORE critical)
     NODE_CPU_WARNING = float(os.getenv("NODE_CPU_WARNING", "60"))  # Early warning
-    NODE_CPU_CRITICAL = float(os.getenv("NODE_CPU_CRITICAL", "75"))  # Critical
-    NODE_MEM_WARNING = float(os.getenv("NODE_MEM_WARNING", "70"))
-    NODE_MEM_CRITICAL = float(os.getenv("NODE_MEM_CRITICAL", "85"))
+    NODE_CPU_CRITICAL = float(os.getenv("NODE_CPU_CRITICAL", "70"))  # Lowered from 75% for earlier action
+    NODE_MEM_WARNING = float(os.getenv("NODE_MEM_WARNING", "60"))  # Lowered from 70%
+    NODE_MEM_CRITICAL = float(os.getenv("NODE_MEM_CRITICAL", "70"))  # Lowered from 85% - act MUCH earlier!
     CONTAINER_CPU_THRESHOLD = float(os.getenv("CONTAINER_CPU_THRESHOLD", "80"))
     NETWORK_OUT_THRESHOLD = float(os.getenv("NETWORK_OUT_THRESHOLD", "40"))
     STALE_SECONDS = int(os.getenv("STALE_SECONDS", "15"))
@@ -582,14 +582,17 @@ class RuleEngine:
         top_container = self._find_top_cpu_container(node)
         if not top_container:
             return None
-        
+
+        service_name = self._extract_service_name(top_container.container)
+
+        # ZERO-DOWNTIME STRATEGY: Use rolling update instead of restart
         return RecoveryAction(
             rule_id="NODE_CPU_HIGH",
-            action_type=ActionType.RESTART_CONTAINER,
+            action_type=ActionType.REDEPLOY_SERVICE,  # Changed from RESTART to REDEPLOY
             target_node=node.node,
             target_container=top_container.container_id,
-            target_service=self._extract_service_name(top_container.container),
-            reason=f"Node CPU {node.cpu}% > {Config.NODE_CPU_CRITICAL}%",
+            target_service=service_name,
+            reason=f"Node CPU {node.cpu}% > {Config.NODE_CPU_CRITICAL}% → zero-downtime rolling update",
             metrics={
                 "node_cpu": node.cpu,
                 "container": top_container.container,
@@ -610,13 +613,21 @@ class RuleEngine:
                          }})
             return None
 
+        service_name = self._extract_service_name(top_container.container)
+
+        # ZERO-DOWNTIME STRATEGY:
+        # Instead of restarting (causes downtime), REDEPLOY the service
+        # This creates a NEW container first, waits for it to be healthy,
+        # then removes the old degraded container
+        # Result: Zero downtime because new container handles traffic during transition
+
         return RecoveryAction(
             rule_id="NODE_MEM_HIGH",
-            action_type=ActionType.RESTART_CONTAINER,
+            action_type=ActionType.REDEPLOY_SERVICE,  # Changed from RESTART to REDEPLOY
             target_node=node.node,
             target_container=top_container.container_id,
-            target_service=self._extract_service_name(top_container.container),
-            reason=f"Node Memory {node.mem}% > {Config.NODE_MEM_CRITICAL}%",
+            target_service=service_name,
+            reason=f"Node Memory {node.mem}% > {Config.NODE_MEM_CRITICAL}% → zero-downtime rolling update",
             metrics={
                 "node_mem": node.mem,
                 "container": top_container.container,
