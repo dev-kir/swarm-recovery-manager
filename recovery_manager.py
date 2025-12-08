@@ -420,24 +420,9 @@ class RuleEngine:
             mem_high = node_metrics.mem > Config.NODE_MEM_CRITICAL
             net_high = node_metrics.net_out > Config.NETWORK_OUT_THRESHOLD
 
-            # SCENARIO 1: Resource exhaustion (migrate)
-            if (cpu_high or mem_high) and not net_high:
-                if self.cooldown.can_act(service_name, ActionType.MIGRATE_CONTAINER):
-                    return RecoveryAction(
-                        action_type=ActionType.MIGRATE_CONTAINER,
-                        service_name=service_name,
-                        problematic_node=node_name,
-                        reason=f"Resource exhaustion on {node_name} (CPU:{node_metrics.cpu:.1f}%, MEM:{node_metrics.mem:.1f}%, NET:{node_metrics.net_out:.1f}Mbps) → migrate",
-                        metrics={
-                            "node": node_name,
-                            "cpu": node_metrics.cpu,
-                            "mem": node_metrics.mem,
-                            "net": node_metrics.net_out,
-                            "scenario": "resource_exhaustion"
-                        }
-                    )
-
+            # CHECK SCENARIO 2 FIRST (more specific condition)
             # SCENARIO 2: High traffic (scale up)
+            # All three metrics high = cluster-wide traffic spike
             if cpu_high and mem_high and net_high:
                 if self.cooldown.can_act(service_name, ActionType.SCALE_UP):
                     return RecoveryAction(
@@ -450,6 +435,24 @@ class RuleEngine:
                             "mem": node_metrics.mem,
                             "net": node_metrics.net_out,
                             "scenario": "high_traffic"
+                        }
+                    )
+
+            # SCENARIO 1: Resource exhaustion (migrate)
+            # CPU/MEM high but network LOW = localized container problem
+            elif (cpu_high or mem_high) and not net_high:
+                if self.cooldown.can_act(service_name, ActionType.MIGRATE_CONTAINER):
+                    return RecoveryAction(
+                        action_type=ActionType.MIGRATE_CONTAINER,
+                        service_name=service_name,
+                        problematic_node=node_name,
+                        reason=f"Resource exhaustion on {node_name} (CPU:{node_metrics.cpu:.1f}%, MEM:{node_metrics.mem:.1f}%, NET:{node_metrics.net_out:.1f}Mbps) → migrate",
+                        metrics={
+                            "node": node_name,
+                            "cpu": node_metrics.cpu,
+                            "mem": node_metrics.mem,
+                            "net": node_metrics.net_out,
+                            "scenario": "resource_exhaustion"
                         }
                     )
 
