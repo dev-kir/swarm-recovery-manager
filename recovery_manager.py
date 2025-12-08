@@ -306,10 +306,14 @@ class NetworkHistoryTracker:
 
     def is_sustained_high(self, node: str, threshold: float) -> bool:
         """
-        Check if network has been consistently above threshold
+        Check if network has been consistently high using MOVING AVERAGE
 
-        Returns True only if ALL recent samples exceed threshold
-        This prevents false positives from brief spikes (e.g., 93 Mbps → 0.3 Mbps → 92 Mbps)
+        Uses moving average instead of requiring ALL samples above threshold.
+        This handles measurement artifacts (brief drops to 0.3 Mbps) while detecting sustained traffic.
+
+        Example:
+          Samples: [92, 5, 95] Mbps
+          Average: 64 Mbps → Above 40 Mbps threshold ✅
         """
         if node not in self.history:
             return False
@@ -320,8 +324,11 @@ class NetworkHistoryTracker:
         if len(samples) < self.history_size:
             return False
 
-        # ALL samples must exceed threshold
-        return all(sample > threshold for sample in samples)
+        # Calculate moving average
+        avg_network = sum(samples) / len(samples)
+
+        # Average must exceed threshold
+        return avg_network > threshold
 
     def get_recent_samples(self, node: str) -> List[float]:
         """Get recent network samples for debugging"""
