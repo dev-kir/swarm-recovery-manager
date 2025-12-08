@@ -280,6 +280,60 @@ class CooldownManager:
 
 
 # ============================================================
+# NETWORK HISTORY TRACKER (for sustained detection)
+# ============================================================
+class NetworkHistoryTracker:
+    """Tracks network history to detect sustained high traffic (not just brief spikes)"""
+
+    def __init__(self, history_size: int = 3):
+        """
+        Args:
+            history_size: Number of consecutive samples required for sustained detection
+        """
+        self.history_size = history_size
+        self.history: Dict[str, List[float]] = defaultdict(list)  # node -> [net_out values]
+
+    def record(self, node: str, net_out: float):
+        """Record a network measurement for a node"""
+        if node not in self.history:
+            self.history[node] = []
+
+        self.history[node].append(net_out)
+
+        # Keep only last N samples
+        if len(self.history[node]) > self.history_size:
+            self.history[node] = self.history[node][-self.history_size:]
+
+    def is_sustained_high(self, node: str, threshold: float) -> bool:
+        """
+        Check if network has been consistently above threshold
+
+        Returns True only if ALL recent samples exceed threshold
+        This prevents false positives from brief spikes (e.g., 93 Mbps → 0.3 Mbps → 92 Mbps)
+        """
+        if node not in self.history:
+            return False
+
+        samples = self.history[node]
+
+        # Need enough samples
+        if len(samples) < self.history_size:
+            return False
+
+        # ALL samples must exceed threshold
+        return all(sample > threshold for sample in samples)
+
+    def get_recent_samples(self, node: str) -> List[float]:
+        """Get recent network samples for debugging"""
+        return self.history.get(node, [])
+
+    def clear(self, node: str):
+        """Clear history for a node"""
+        if node in self.history:
+            del self.history[node]
+
+
+# ============================================================
 # SERVICE STATE TRACKER
 # ============================================================
 class ServiceStateTracker:
@@ -359,9 +413,10 @@ class ServiceStateTracker:
 class RuleEngine:
     """Evaluates metrics and determines recovery actions"""
 
-    def __init__(self, cooldown: CooldownManager, state_tracker: ServiceStateTracker):
+    def __init__(self, cooldown: CooldownManager, state_tracker: ServiceStateTracker, network_tracker: NetworkHistoryTracker):
         self.cooldown = cooldown
         self.state_tracker = state_tracker
+        self.network_tracker = network_tracker
 
     def evaluate(self, nodes: Dict[str, NodeMetrics]) -> List[RecoveryAction]:
         actions = []
@@ -418,22 +473,30 @@ class RuleEngine:
 
             cpu_high = container.cpu > Config.CONTAINER_CPU_THRESHOLD or node_metrics.cpu > Config.NODE_CPU_CRITICAL
             mem_high = node_metrics.mem > Config.NODE_MEM_CRITICAL
-            net_high = node_metrics.net_out > Config.NETWORK_OUT_THRESHOLD
+
+            # SUSTAINED network detection (requires 3 consecutive samples above threshold)
+            # This prevents false positives from brief spikes (e.g., 93 Mbps → 0.3 Mbps → 92 Mbps)
+            net_high = self.network_tracker.is_sustained_high(node_name, Config.NETWORK_OUT_THRESHOLD)
 
             # CHECK SCENARIO 2 FIRST (more specific condition)
             # SCENARIO 2: High traffic (scale up)
             # All three metrics high = cluster-wide traffic spike
             if cpu_high and mem_high and net_high:
                 if self.cooldown.can_act(service_name, ActionType.SCALE_UP):
+                    # Get network history for logging
+                    net_history = self.network_tracker.get_recent_samples(node_name)
+                    net_history_str = f"[{', '.join(f'{v:.1f}' for v in net_history)}]"
+
                     return RecoveryAction(
                         action_type=ActionType.SCALE_UP,
                         service_name=service_name,
-                        reason=f"High traffic on {node_name} (CPU:{node_metrics.cpu:.1f}%, MEM:{node_metrics.mem:.1f}%, NET:{node_metrics.net_out:.1f}Mbps) → scale +1",
+                        reason=f"Sustained high traffic on {node_name} (CPU:{node_metrics.cpu:.1f}%, MEM:{node_metrics.mem:.1f}%, NET:{net_history_str}Mbps sustained) → scale +1",
                         metrics={
                             "node": node_name,
                             "cpu": node_metrics.cpu,
                             "mem": node_metrics.mem,
-                            "net": node_metrics.net_out,
+                            "net_out": node_metrics.net_out,
+                            "net_history": net_history,
                             "scenario": "high_traffic"
                         }
                     )
@@ -643,8 +706,9 @@ class RecoveryManager:
         self.client_manager = DockerClientManager()
         self.poller = MetricPoller()
         self.cooldown = CooldownManager()
+        self.network_tracker = NetworkHistoryTracker(history_size=3)  # Require 3 consecutive high samples
         self.state_tracker = ServiceStateTracker(self.client_manager)
-        self.rule_engine = RuleEngine(self.cooldown, self.state_tracker)
+        self.rule_engine = RuleEngine(self.cooldown, self.state_tracker, self.network_tracker)
         self.executor = ActionExecutor(self.client_manager, self.cooldown)
         self.running = True
 
@@ -681,6 +745,10 @@ class RecoveryManager:
         if not nodes:
             return
 
+        # Record network samples for sustained detection
+        for node_name, node_metrics in nodes.items():
+            self.network_tracker.record(node_name, node_metrics.net_out)
+
         # Evaluate rules
         actions = self.rule_engine.evaluate(nodes)
 
@@ -708,7 +776,7 @@ class RecoveryManager:
         print(f"  CPU Critical:        {Config.NODE_CPU_CRITICAL}%")
         print(f"  Memory Critical:     {Config.NODE_MEM_CRITICAL}%")
         print(f"  Container CPU:       {Config.CONTAINER_CPU_THRESHOLD}%")
-        print(f"  Network Threshold:   {Config.NETWORK_OUT_THRESHOLD} Mbps")
+        print(f"  Network Threshold:   {Config.NETWORK_OUT_THRESHOLD} Mbps (sustained: {self.network_tracker.history_size} samples)")
         print(f"  Cooldown Migrate:    {Config.COOLDOWN_MIGRATE}s")
         print(f"  Cooldown Scale Up:   {Config.COOLDOWN_SCALE_UP}s")
         print(f"  Cooldown Scale Down: {Config.COOLDOWN_SCALE_DOWN}s")
